@@ -26,6 +26,7 @@ Do **not** deploy until every item below is explicitly marked done by the operat
     ```
 - [ ] **Monitoring and alerting live**
   - Stellar Expert webhook configured for vault + channel contracts.
+  - Alerts configured for `upgrade_proposed`, `upgrade_cancelled`, and `upgraded` events.
   - Supabase alerting configured for `policy_reject` spikes.
   - Command:
     ```bash
@@ -106,7 +107,7 @@ Call `client.preflight(manifest)` explicitly to validate a manifest's asset trus
 
 ### Mandatory `USDC_ASSET_CONTRACT` on Mainnet
 
-> ⚠️ **MANDATORY CONFIGURATION:** `USDC_ASSET_CONTRACT` is **required** on mainnet for both providers and the agent. In `@routedock/routedock`, `resolveAssetContract` throws an error if `USDC_ASSET_CONTRACT` is missing on mainnet because only testnet has a default fallback contract address.
+> ⚠️ **MANDATORY CONFIGURATION:** `USDC_ASSET_CONTRACT` is **required** on mainnet for both providers and the agent. `resolveAssetContract` in `apps/provider-a/src/worker.ts` and `apps/provider-b/src/config.ts` throws an error if `USDC_ASSET_CONTRACT` is missing on mainnet, because only testnet has a default fallback contract address — each provider refuses to serve on mainnet without it, and `/health` returns 503 naming `USDC_ASSET_CONTRACT` as missing.
 
 Obtain or deploy the Stellar Asset Contract (SAC) wrapper ID for mainnet USDC and record it as `USDC_ASSET_CONTRACT`.
 
@@ -120,18 +121,30 @@ Build and deploy from `contracts/agent-vault`:
 cd contracts/agent-vault
 stellar contract build
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/agent_vault.wasm \
+  --wasm target/wasm32v1-none/release/agent_vault.wasm \
   --source <MAINNET_DEPLOYER_ALIAS> \
-  --network mainnet
+  --network mainnet \
+  -- \
+  --admin <ADMIN_G_ADDRESS> \
+  --agent_pk <AGENT_ED25519_PUBKEY_64_HEX> \
+  --daily_cap 250000000 \
+  --allowlist '{"<PAYEE_G_ADDRESS>":"250000000"}' \
+  --expiry_ledger <ABSOLUTE_LEDGER_SEQUENCE> \
+  --lifetime_cap 0
 ```
 
 Record the output as `AGENT_VAULT_CONTRACT_ID`.
 
-Apply stricter production policy inputs:
+### Constructor Parameter Units & Stricter Production Policy
 
-- **Daily cap:** set conservative cap (example `25` USDC/day).
-- **Allowlist:** only production provider payee accounts.
-- **Expiry:** short session key lifetime (example 1-6 hours by ledger window).
+Deploy-time arguments configure the vault atomically in `__constructor`:
+
+- **`--admin`**: Vault administrator Stellar G-address holding exclusive authorization for admin entrypoints (`set_daily_cap`, `add_to_allowlist`, `remove_from_allowlist`, `set_expiry`, `set_agent_pubkey`, `freeze`/`unfreeze`, `upgrade`, `transfer_admin`).
+- **`--agent_pk`**: Agent's 32-byte Ed25519 public key as 64 hex characters used to authorize payments via `__check_auth`.
+- **`--daily_cap`**: Daily spend cap in USDC stroops, where 1 USDC = 10,000,000 stroops (`250000000` = 25 USDC/day conservative cap).
+- **`--allowlist`**: Map of payee address to daily sub-cap in stroops (JSON object format, e.g. `'{"<PAYEE_G_ADDRESS>":"250000000"}'`). Restrict to production provider payee accounts.
+- **`--expiry_ledger`**: Absolute ledger sequence (compared against `env.ledger().sequence()`, **not** a relative duration). Set a short session key lifetime (e.g. current ledger + 720 for ~1 hour, or 4,320 for ~6 hours).
+- **`--lifetime_cap`**: Total USDC stroops the vault may ever spend over its lifetime. Set to `0` for unlimited.
 
 Example environment snippet for agent runtime:
 
@@ -142,6 +155,19 @@ AGENT_VAULT_CONTRACT_ID=<C...>
 ALLOWED_PAYEES=<G...>,<G...>
 SESSION_EXPIRY_LEDGERS=450
 ```
+
+### Timelocked Wasm upgrade runbook
+
+New deployments enforce a fixed 17,280-ledger delay (approximately one day) from the first proposal. Upgrades on a contract still running the previous Wasm require one unavoidable bootstrap invocation through its old immediate `upgrade` entry point; the old deployed code cannot enforce a rule it does not contain. After that transition, use the new flow exclusively:
+
+1. Build and independently review the target Wasm, then upload it and record its exact 32-byte hash.
+2. Call `propose_upgrade(new_wasm_hash)` with the vault admin. Record the `upgrade_proposed` event and verify `pending_upgrade` returns the expected hash and `ready_at_ledger`.
+3. Notify vault operators and governed payers, link the reviewed build, and allow the full ledger delay. Rescheduling replaces the target and restarts the delay.
+4. If the proposal is no longer approved, call `cancel_upgrade` before execution and verify `upgrade_cancelled` plus an empty `pending_upgrade`.
+5. At or after `ready_at_ledger`, call `execute_upgrade()` with the vault admin. Verify the system executable update and custom `upgraded` event contain the approved hash.
+6. Re-check `daily_cap`, `allowlist`, `agent_pubkey`, and `expiry_ledger`, then run a capped authorization smoke test before restoring traffic.
+
+The timelock provides notice for code replacement only. The same admin can still rotate keys and change policy settings; use hardware-backed custody, alerts, and tested operator procedures.
 
 ---
 
@@ -291,6 +317,8 @@ curl -s https://api-b.routedock.xyz/health
 
 Configure alerts for:
 - agent vault contract invocations
+- `upgrade_proposed` and `upgrade_cancelled` events (page the upgrade owner immediately)
+- `upgraded` events (verify the executable hash and retained policy storage)
 - channel open/close transactions
 - failed transactions involving payee accounts
 

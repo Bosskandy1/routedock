@@ -23,14 +23,17 @@ export class NulthClient {
   constructor(private readonly config: NulthClientConfig) {
     this.policy = { ...config.policy }
     this.prover = config.prover ?? DEFAULT_PROVER
-    if (config.network === 'mainnet' && this.prover === 'mock') {
+    if (this.prover !== 'mock') {
       throw new Error(
-        'NulthClient cannot use the insecure mock prover on mainnet; a production prover is required',
+        `NulthClient: unknown prover backend ${String(config.prover)}; only 'mock' is implemented`,
       )
     }
-    if (this.prover === 'mock') {
-      console.warn('NulthClient is using the insecure mock prover; proofs are not cryptographically sound')
+    if (config.network !== 'testnet') {
+      throw new Error(
+        `NulthClient cannot use the insecure mock prover on mainnet; a production prover is required (network must be 'testnet', got ${String(config.network)})`,
+      )
     }
+    console.warn('NulthClient is using the insecure mock prover; proofs are not cryptographically sound')
   }
 
   get nulthAccount(): string {
@@ -105,6 +108,13 @@ export class NulthClient {
   }
 
   private enforcePolicy(context: PaymentAuthContext): void {
+    if (context.amountStroops < 0n) {
+      throw new RangeError(`Invalid amountStroops: ${context.amountStroops}`)
+    }
+    if (!Number.isSafeInteger(context.ledgerSequence) || context.ledgerSequence < 0) {
+      throw new RangeError(`Invalid ledgerSequence: ${context.ledgerSequence}`)
+    }
+
     if (
       this.policy.expiryLedger !== undefined &&
       context.ledgerSequence > this.policy.expiryLedger
@@ -128,3 +138,4 @@ export class NulthClient {
     }
   }
 }
+

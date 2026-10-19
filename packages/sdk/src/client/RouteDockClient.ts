@@ -1,5 +1,5 @@
 import { Keypair, Horizon } from '@stellar/stellar-sdk'
-import { fetchManifest, selectMode, invalidateManifest as evictManifest, assertManifestValid, type ModeSelectOptions, type RouteDockLogger } from './ModeRouter.js'
+import { fetchManifest, selectMode, invalidateManifest as evictManifest, assertManifestValid, assertEndpointActive, type ModeSelectOptions, type RouteDockLogger } from './ModeRouter.js'
 import { X402Client } from './x402Client.js'
 import { MppChargeClient } from './MppChargeClient.js'
 import { MppSessionClient } from './MppSessionClient.js'
@@ -7,8 +7,9 @@ import { prepareNulthSigner, NulthPolicyError, type NulthVaultConfig } from './N
 import type { PaymentResult, SessionHandle, SessionOptions, RouteDockManifest, PaymentMode, EstimateCostResult, PreflightResult } from '../types.js'
 import { RouteDockManifestError, RouteDockPolicyRejectError, RouteDockTrustlineError } from '../errors.js'
 import type { RetryPolicy } from '../internal/retry.js'
-import { usdcToStroops } from '../internal/usdc.js'
+import { USDC_ISSUERS, usdcToStroops } from '../internal/usdc.js'
 import { InMemorySpendStore, type DailySpend, type SpendStore } from '../store/SpendStore.js'
+import { selectAsset } from '../internal/assetUtils.js'
 
 // Commitment secrets are stored here instead of on the instance so they never
 // appear in JSON.stringify, structured-clone, or console.log object dumps.
@@ -27,8 +28,60 @@ export interface SpendCap {
    * Both limits are enforced independently — hitting an endpoint cap does
    * not prevent spend on other endpoints, but all spend still counts toward
    * the global cap.
+   *
+   * Keys are normalized to `new URL(key).origin` when the client is
+   * constructed (lowercased host, no trailing slash, no default port), so
+   * "https://API.example.com/", "https://api.example.com" and
+   * "https://api.example.com:443" are all equivalent. A key that isn't a
+   * valid URL, that includes a path/query/hash, or that normalizes to the
+   * same origin as another key throws at construction time.
    */
   endpointCaps?: Record<string, string>
+}
+
+/**
+ * Normalizes `spendCap.endpointCaps` keys to their URL origin so the exact
+ * string-match lookup in `_checkAndReserveSpend` (against `new URL(url).origin`)
+ * can't be silently defeated by a trailing slash, a path, a mismatched case,
+ * or an explicit default port. Throws a typed config error rather than
+ * dropping the cap, since a cap that silently never applies is worse than
+ * one that fails loudly at startup.
+ */
+function normalizeEndpointCaps(
+  endpointCaps: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!endpointCaps) return undefined
+
+  const normalized: Record<string, string> = {}
+  for (const [key, value] of Object.entries(endpointCaps)) {
+    let url: URL
+    try {
+      url = new URL(key)
+    } catch {
+      throw new RouteDockManifestError(
+        `spendCap.endpointCaps key "${key}" is not a valid URL — use an origin such as "https://api.example.com"`,
+      )
+    }
+    if (url.pathname !== '/' || url.search !== '' || url.hash !== '') {
+      throw new RouteDockManifestError(
+        `spendCap.endpointCaps key "${key}" must be an origin only (no path, query, or hash) — use "${url.origin}"`,
+      )
+    }
+    const origin = url.origin
+    if (Object.prototype.hasOwnProperty.call(normalized, origin)) {
+      throw new RouteDockManifestError(
+        `spendCap.endpointCaps has two keys that both normalize to origin "${origin}" — remove the duplicate`,
+      )
+    }
+    normalized[origin] = value
+  }
+  return normalized
+}
+
+/** Returns a copy of `spendCap` with `endpointCaps` keys normalized to their origin. */
+function normalizeSpendCap(spendCap: SpendCap): SpendCap {
+  const endpointCaps = normalizeEndpointCaps(spendCap.endpointCaps)
+  return endpointCaps === undefined ? spendCap : { ...spendCap, endpointCaps }
 }
 
 export type VaultConfig = NulthVaultConfig
@@ -37,7 +90,7 @@ export interface RouteDockClientConfig {
   /** Stellar keypair or raw secret key (S...) — fee payer / fallback signer */
   wallet: Keypair | string
   network: 'testnet' | 'mainnet'
-  /** Optional local daily spend cap — checked before every payment (local-key vault only) */
+  /** Optional local daily spend cap — checked before every payment, nulth vault payments included */
   spendCap?: SpendCap
   /**
    * Ed25519 secret key (S...) for signing channel commitments. Required for mpp-session.
@@ -94,10 +147,7 @@ export const usdcToMicros = usdcToStroops
  * Used by the trustline preflight to produce exact remediation commands.
  */
 const ASSET_ISSUERS: Record<string, Record<string, string>> = {
-  USDC: {
-    testnet: 'GBQY2K7IZDSK5QN3OF6ZSOLQ6CWAH5Q5JXEG5Q3S4OD5B7LYO24B6B6L',
-    mainnet: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-  },
+  USDC: USDC_ISSUERS,
 }
 
 function getAssetIssuer(asset: string, network: string): string {
@@ -153,10 +203,15 @@ export class RouteDockClient {
     this.keypair =
       typeof config.wallet === 'string' ? Keypair.fromSecret(config.wallet) : config.wallet
     this.network = config.network
-    this.spendCap = config.spendCap
+    this.spendCap = config.spendCap ? normalizeSpendCap(config.spendCap) : undefined
     this.retryPolicy = config.retryPolicy
     // Only warn about non-durability when a spend cap is actually configured.
-    this.spendStore = config.spendStore ?? new InMemorySpendStore({ warn: !!config.spendCap })
+    this.spendStore =
+      config.spendStore ??
+      new InMemorySpendStore({
+        warn: !!config.spendCap,
+        ...(config.logger && { logger: config.logger }),
+      })
     this.logger = config.logger
     this.manifestTimeoutMs = config.manifestTimeoutMs
     this.expectedPayee = config.expectedPayee
@@ -171,9 +226,12 @@ export class RouteDockClient {
     }
 
     const secretKey = this.keypair.secret()
-    this.x402 = new X402Client(secretKey, this.network, this.retryPolicy)
-    this.charge = new MppChargeClient(this.keypair, this.network, this.retryPolicy)
-    this.session = new MppSessionClient(this.keypair, this.network, this.retryPolicy)
+    // Carry the client's logger into retry diagnostics so a consumer that
+    // silences the SDK silences the retry path too.
+    const retryPolicy = this.logger ? { ...this.retryPolicy, logger: this.logger } : this.retryPolicy
+    this.x402 = new X402Client(secretKey, this.network, retryPolicy)
+    this.charge = new MppChargeClient(this.keypair, this.network, retryPolicy)
+    this.session = new MppSessionClient(this.keypair, this.network, retryPolicy, undefined, this.logger)
   }
 
   /** Fetch manifest and select mode — shared by pay() and estimateCost(). */
@@ -183,6 +241,7 @@ export class RouteDockClient {
   ): Promise<{ manifest: RouteDockManifest; mode: PaymentMode }> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
+    assertEndpointActive(manifest, url, this.logger)
     const mode = selectMode(manifest, options)
     return { manifest, mode }
   }
@@ -205,12 +264,19 @@ export class RouteDockClient {
    * call before committing to a payment — for approval gates and manual
    * trustline remediation.
    */
-  async preflight(manifest: RouteDockManifest): Promise<PreflightResult> {
+  async preflight(
+    manifest: RouteDockManifest,
+    mode?: PaymentMode,
+    endpoint?: string,
+  ): Promise<PreflightResult> {
     assertManifestValid(manifest)
-    await this._checkTrustline(manifest)
+    const selectedAsset = mode
+      ? selectAsset(manifest, mode, endpoint).asset
+      : manifest.asset
+    await this._checkTrustline(manifest, selectedAsset)
     return {
       hasTrustline: true,
-      asset: manifest.asset,
+      asset: selectedAsset,
       modes: manifest.modes,
       ...(manifest.regions && { regions: manifest.regions }),
       ...(manifest.latency_hints && { latency_hints: manifest.latency_hints }),
@@ -227,8 +293,9 @@ export class RouteDockClient {
    */
   private async _checkTrustline(
     manifest: RouteDockManifest,
+    targetAsset: string = manifest.asset,
   ): Promise<void> {
-    const cacheKey = `${this.network}:${this.keypair.publicKey()}:${manifest.asset}`
+    const cacheKey = `${this.network}:${this.keypair.publicKey()}:${targetAsset}`
     const cached = RouteDockClient._trustlineCache.get(cacheKey)
     if (cached && Date.now() < cached.expiresAt) return
 
@@ -241,19 +308,21 @@ export class RouteDockClient {
     try {
       const account = await server.loadAccount(this.keypair.publicKey())
       const balances = account.balances as unknown[]
+      const expectedIssuer = getAssetIssuer(targetAsset, this.network)
       const hasTrustline = balances.some(
         (b) =>
           typeof b === 'object' &&
           b !== null &&
-          'asset_code' in b &&
-          (b as Record<string, unknown>).asset_code === manifest.asset,
+          ((targetAsset === 'XLM' && (b as Record<string, unknown>).asset_type === 'native') ||
+            ('asset_code' in b &&
+              (b as Record<string, unknown>).asset_code === targetAsset &&
+              (!expectedIssuer || (b as Record<string, unknown>).asset_issuer === expectedIssuer))),
       )
       if (!hasTrustline) {
-        const issuer = getAssetIssuer(manifest.asset, this.network)
-        const remediation = issuer
-          ? `Run: stellar tx new --source ${this.keypair.publicKey()} --network ${this.network} change-trust --asset ${manifest.asset}:${issuer} --limit 100000`
-          : `Establish a trustline for ${manifest.asset} with the appropriate issuer on ${this.network}`
-        throw new RouteDockTrustlineError(manifest.asset, issuer || 'unknown', remediation)
+        const remediation = expectedIssuer
+          ? `Run: stellar tx new --source ${this.keypair.publicKey()} --network ${this.network} change-trust --asset ${targetAsset}:${expectedIssuer} --limit 100000`
+          : `Establish a trustline for ${targetAsset} with the appropriate issuer on ${this.network}`
+        throw new RouteDockTrustlineError(targetAsset, expectedIssuer || 'unknown', remediation)
       }
       RouteDockClient._trustlineCache.set(cacheKey, {
         exists: true,
@@ -262,7 +331,8 @@ export class RouteDockClient {
     } catch (err) {
       if (err instanceof RouteDockTrustlineError) throw err
       this.logger?.(
-        `[RouteDock] Trustline preflight: could not verify trustline for ${manifest.asset} — continuing`,
+        'warn',
+        `[RouteDock] Trustline preflight: could not verify trustline for ${targetAsset} — continuing`,
       )
     }
   }
@@ -271,19 +341,20 @@ export class RouteDockClient {
    * Pay for one request at `url`. Fetches manifest, selects payment mode,
    * runs trustline preflight, reserves local spend cap BEFORE executing the
    * payment, then commits the spend record on success. Rolls back the
-   * reservation if the on-chain payment fails. Concurrent pay() calls are
-   * serialized through a per-instance mutex to prevent spend-cap overrun.
+   * reservation if the on-chain payment fails, and also when the call
+   * completes without paying anything (an x402 endpoint answering a plain
+   * 200 with no challenge). Concurrent pay() calls are serialized through a
+   * per-instance mutex to prevent spend-cap overrun.
    */
   async pay(url: string, options?: ModeSelectOptions): Promise<PaymentResult> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
+    assertEndpointActive(manifest, url, this.logger)
     const mode = selectMode(manifest, { ...options, ...(this.logger && { logger: this.logger }) })
 
-    await this._checkTrustline(manifest)
+    const selectedAsset = selectAsset(manifest, mode, url).asset
 
-    if (this.vault?.mode === 'nulth') {
-      return this._payWithNulthVault(url, manifest, mode)
-    }
+    await this._checkTrustline(manifest, selectedAsset)
 
     let amount: string
     switch (mode) {
@@ -302,26 +373,44 @@ export class RouteDockClient {
         throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
     }
 
+    // Reserve before dispatching so no path can spend outside the cap.
     const reserveId = await this._checkAndReserveSpend(amount, baseUrl)
 
     let result: PaymentResult
     try {
-      switch (mode) {
-        case 'x402':
-          result = await this.x402.pay(url, manifest)
-          break
-        case 'mpp-charge':
-          result = await this.charge.pay(url, manifest)
-          break
-        default:
-          throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
+      if (this.vault?.mode === 'nulth') {
+        // Mode/prover validation errors thrown here must also release the
+        // reservation, which is why the call sits inside this try block.
+        result = await this._payWithNulthVault(url, manifest, mode)
+      } else {
+        switch (mode) {
+          case 'x402':
+            result = await this.x402.pay(url, manifest)
+            break
+          case 'mpp-charge':
+            result = await this.charge.pay(url, manifest)
+            break
+          default:
+            throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
+        }
       }
     } catch (err) {
       await this._rollbackSpend(reserveId).catch(() => {})
       throw err
     }
 
-    await this._commitSpend(reserveId)
+    // A real payment keeps its reservation. `X402Client` returns
+    // `{ txHash: null, amount: '0' }` only from its non-402 branch, where
+    // nothing was signed or paid (a plain 200, e.g. a path outside the
+    // paywall), so that reservation must be released rather than charged
+    // against the daily and endpoint caps. Paid results carry the manifest
+    // price even when the facilitator omits the settlement header, so they
+    // still commit. See #325 (regression of #139).
+    if (result.txHash === null && result.amount === '0') {
+      await this._rollbackSpend(reserveId)
+    } else {
+      await this._commitSpend(reserveId)
+    }
     return result
   }
 
@@ -380,9 +469,11 @@ export class RouteDockClient {
         throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
     }
 
+    const selectedAsset = selectAsset(manifest, mode, url).asset
+
     return {
       amount,
-      asset: manifest.asset,
+      asset: selectedAsset,
       mode,
       manifest,
       ...(manifest.regions && { regions: manifest.regions }),
@@ -402,6 +493,7 @@ export class RouteDockClient {
   async openSession(url: string, options?: SessionOptions): Promise<SessionHandle> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
+    assertEndpointActive(manifest, url, this.logger)
 
     const mode = options?.mode ?? 'mpp-session'
     if (!manifest.modes.includes(mode)) {
@@ -564,3 +656,4 @@ export class RouteDockClient {
     })
   }
 }
+

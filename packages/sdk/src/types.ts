@@ -4,8 +4,21 @@
  *
  * Section 5 of ROUTEDOCK_MASTER.md is the canonical specification.
  */
+import type { Store } from 'mppx'
 
 export type PaymentMode = 'x402' | 'mpp-charge' | 'mpp-session' | 'mpp-session-ws'
+
+/** Payment asset configuration with optional mode/endpoint scoping */
+export interface AssetConfig {
+  /** Asset ticker symbol, e.g. "USDC" or "XLM" */
+  asset: string
+  /** Stellar Asset Contract (SAC) address for this payment asset */
+  asset_contract: string
+  /** Optional: restrict this asset to specific payment modes. If omitted, available for all modes. */
+  modes?: PaymentMode[]
+  /** Optional: restrict this asset to specific endpoints (by name). If omitted, available for all endpoints. */
+  endpoints?: string[]
+}
 
 /**
  * Agent custody mode — declared in routedock.json when provider accepts ZK vault payers.
@@ -61,9 +74,16 @@ export interface SLAConfig {
 export interface EndpointDescriptor {
   method: string
   path: string
-  /** Whether this endpoint is retained only for backwards compatibility. */
+  /**
+   * Whether this endpoint is retained only for backwards compatibility.
+   * The SDK logs a `[RouteDock] WARNING:` line before paying a deprecated
+   * endpoint.
+   */
   deprecated?: boolean
-  /** ISO 8601 timestamp after which callers should stop using this endpoint. */
+  /**
+   * ISO 8601 timestamp after which callers should stop using this endpoint.
+   * The SDK refuses to pay (`RouteDockManifestSunsetError`) once it has passed.
+   */
   sunset_at?: string
   headers?: Record<string, string>
   request_schema?: unknown
@@ -102,6 +122,12 @@ export interface RouteDockManifest {
   asset: string
   /** Stellar Asset Contract (SAC) address for the payment asset */
   asset_contract: string
+  /**
+   * Payment assets accepted by this provider. Each asset can be scoped to specific
+   * modes and endpoints. When present, assets[0] must match the root-level
+   * asset and asset_contract.
+   */
+  assets?: AssetConfig[]
   /**
    * Stellar address (G...) that receives payments. Used as the default
    * recipient for all modes. Individual per-request modes (x402, mpp-charge)
@@ -279,15 +305,53 @@ export interface SessionOptions {
    * Infinity to disable the guard (not recommended).
    */
   maxDurationMs?: number
+  /**
+   * Optional persistent store for the client-side cumulative baseline.
+   *
+   * Every challenge is validated against what this client has already signed,
+   * so without a store a session refuses a challenge that reports a non-zero
+   * cumulative — it cannot tell how much a channel already owes from an earlier
+   * session (e.g. across an agent restart that skipped `close()`). Supply a
+   * store to resume such a channel, or close it first.
+   */
+  store?: Store.Store
 }
 
-/** Lifecycle events emitted by a SessionHandle. */
-export type SessionEvent = 'session:timeout'
+/**
+ * Lifecycle events emitted by a SessionHandle.
+ *
+ * - 'session:timeout' — the maxDurationMs budget elapsed; auto-close started.
+ * - 'session:close-failed' — that auto-close rejected. The channel may still
+ *   hold collateral, so the caller should retry close() or fall back to
+ *   requestRefund().
+ */
+export type SessionEvent = 'session:timeout' | 'session:close-failed'
 
 /** Payload delivered with the 'session:timeout' event. */
 export interface SessionTimeoutPayload {
   /** The wall-clock budget (ms) that elapsed before auto-close was triggered. */
   maxDurationMs: number
+}
+
+/** Payload delivered with the 'session:close-failed' event. */
+export interface SessionCloseFailedPayload {
+  /** The wall-clock budget (ms) that elapsed before auto-close was triggered. */
+  maxDurationMs: number
+  /**
+   * The rejection thrown by the failed auto-close. Typed `unknown` because the
+   * close path wraps transport, RPC, and channel-state failures, and a rejection
+   * is not guaranteed to be an Error.
+   */
+  error: unknown
+}
+
+/**
+ * Maps each lifecycle event to the payload its listener receives, so on() can
+ * narrow the callback argument per event.
+ */
+export interface SessionEventPayloadMap {
+  'session:timeout': SessionTimeoutPayload
+  'session:close-failed': SessionCloseFailedPayload
 }
 
 /**
@@ -325,6 +389,12 @@ export interface SessionHandle {
    * HTTP, upgrades the connection to WebSocket, and yields each server frame
    * (JSON frames parsed, raw strings yielded as-is). The stream ends when the
    * server closes the socket with a normal close code.
+   *
+   * Once close() has been called (manually or by the maxDurationMs lifetime
+   * guard), the next next() on an mpp-session iterator rejects with a
+   * RouteDockChannelStateError whose message is "session closed" instead of
+   * signing another voucher. Pipelined streams (concurrency > 1) stop refilling
+   * their in-flight window the same way.
    * UNAUDITED: uses stellar-experimental/one-way-channel contract.
    */
   stream(options?: StreamOptions): AsyncIterable<unknown>
@@ -345,9 +415,13 @@ export interface SessionHandle {
   getDisputeStatus(): Promise<DisputeStatus>
   /**
    * Subscribe to a session lifecycle event (e.g. 'session:timeout').
-   * Returns an unsubscribe function.
+   * Returns an unsubscribe function. Throwing inside the listener is caught;
+   * a rejected promise it returns is swallowed the same way.
    */
-  on(event: SessionEvent, listener: (payload: SessionTimeoutPayload) => void): () => void
+  on<E extends SessionEvent>(
+    event: E,
+    listener: (payload: SessionEventPayloadMap[E]) => void,
+  ): () => void
 }
 
 /**
@@ -359,6 +433,8 @@ export interface SessionState {
   channel_id: string
   payee: string
   payer: string
+  channel_contract: string
+  network: 'testnet' | 'mainnet'
   /** Monotonically increasing cumulative amount — stored as string to preserve precision */
   cumulative_amount: string
   last_signature: string
@@ -389,3 +465,4 @@ export {
 
 /** Dispute status of a channel */
 export type DisputeStatus = 'open' | 'in-refund-window' | 'refundable' | 'settled'
+

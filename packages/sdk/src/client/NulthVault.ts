@@ -1,16 +1,17 @@
 /**
  * NulthVault — self-contained Nulth ZK account support for RouteDock SDK.
  *
- * All nulth-sdk logic is inlined here so this file has zero imports from
- * @routedock/nulth-sdk. This avoids workspace-resolution issues in CI
- * where the package may not be built before the DTS worker runs.
+ * @routedock/nulth-sdk is a workspace dependency, so usdcToStroops
+ * is imported from @routedock/nulth-sdk via ../internal/usdc.js.
  */
 import { createHash } from 'node:crypto'
-import { rpc, hash } from '@stellar/stellar-sdk'
+import { Address, rpc, hash, scValToNative, xdr } from '@stellar/stellar-sdk'
 import type { ClientStellarSigner } from '@x402/stellar'
 import type { SignAuthEntry } from '@stellar/stellar-sdk/contract'
 import type { RouteDockManifest, PaymentMode, VaultMode } from '../types.js'
 import { RouteDockManifestError } from '../errors.js'
+import { usdcToStroops } from '../internal/usdc.js'
+import { resolveLogger, type RouteDockLogger } from '../internal/logger.js'
 
 // ---------------------------------------------------------------------------
 // Inlined types (from @routedock/nulth-sdk/types)
@@ -58,10 +59,12 @@ export interface NulthClientConfig {
   prover?: 'mock'
   policy: NulthPolicyState
   verifierContract?: string
+  /** Log sink for the mock-prover warning. Defaults to a console-backed logger. */
+  logger?: RouteDockLogger
 }
 
 export class NulthPolicyError extends Error {
-  readonly code: 'payee_not_allowed' | 'daily_cap_exceeded' | 'session_expired'
+  readonly code: 'payee_not_allowed' | 'daily_cap_exceeded' | 'session_expired' | 'auth_entry_mismatch'
   constructor(code: NulthPolicyError['code'], message: string) {
     super(message)
     this.name = 'NulthPolicyError'
@@ -100,6 +103,96 @@ function authDigestFromEntry(authEntryBase64: string): string {
   return sha256Hex(entryHash)
 }
 
+/**
+ * Verify that the Soroban auth entry actually being signed matches the
+ * off-chain payment context the policy was checked against. Without this,
+ * the policy (allowlist + daily cap) checks `context.payee` /
+ * `context.amountStroops` while a completely different transfer — a
+ * different recipient, amount, or asset — can be the one that actually
+ * gets signed and submitted.
+ *
+ * Mirrors @routedock/nulth-sdk's assertAuthEntryMatchesContext. Kept inline
+ * (see file header) rather than imported.
+ */
+function assertAuthEntryMatchesContext(
+  authEntry: string,
+  from: string,
+  ctx: Omit<PaymentAuthContext, 'authEntry'>,
+): void {
+  let preimage: xdr.HashIdPreimage
+  try {
+    preimage = xdr.HashIdPreimage.fromXDR(authEntry, 'base64')
+  } catch {
+    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry does not decode as a HashIdPreimage')
+  }
+
+  if (preimage.switch() !== xdr.EnvelopeType.envelopeTypeSorobanAuthorization()) {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      'authEntry is not a Soroban authorization preimage',
+    )
+  }
+
+  const inv = preimage.sorobanAuthorization().invocation()
+
+  if (inv.subInvocations().length !== 0) {
+    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry has unexpected sub-invocations')
+  }
+
+  if (
+    inv.function().switch() !== xdr.SorobanAuthorizedFunctionType.sorobanAuthorizedFunctionTypeContractFn()
+  ) {
+    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry does not invoke a contract function')
+  }
+
+  const fn = inv.function().contractFn()
+
+  const contractAddress = Address.fromScAddress(fn.contractAddress()).toString()
+  if (contractAddress !== ctx.assetContract) {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      `authEntry contract ${contractAddress} does not match assetContract ${ctx.assetContract}`,
+    )
+  }
+
+  const functionName = fn.functionName().toString()
+  if (functionName !== 'transfer') {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      `authEntry function ${functionName} does not match expected transfer`,
+    )
+  }
+
+  const args = fn.args()
+  if (args.length !== 3) {
+    throw new NulthPolicyError('auth_entry_mismatch', `authEntry transfer has ${args.length} args, expected 3`)
+  }
+
+  const entryFrom = scValToNative(args[0]!) as string
+  if (entryFrom !== from) {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      `authEntry from ${entryFrom} does not match nulthAccount ${from}`,
+    )
+  }
+
+  const entryTo = scValToNative(args[1]!) as string
+  if (entryTo !== ctx.payee) {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      `authEntry to ${entryTo} does not match paymentContext.payee ${ctx.payee}`,
+    )
+  }
+
+  const entryAmount = scValToNative(args[2]!) as bigint
+  if (entryAmount !== ctx.amountStroops) {
+    throw new NulthPolicyError(
+      'auth_entry_mismatch',
+      `authEntry amount ${entryAmount} does not match paymentContext.amountStroops ${ctx.amountStroops}`,
+    )
+  }
+}
+
 function insecureMockProof(preimage: string): string {
   return createHash('sha512').update(`nulth:${preimage}`).digest('base64')
 }
@@ -107,12 +200,6 @@ function insecureMockProof(preimage: string): string {
 function encodeAuthSignature(proof: NulthProof): string {
   const payload: NulthAuthSignature = { nulth: 'zk-v1', proof }
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-}
-
-function usdcToStroops(amount: string): bigint {
-  const [whole = '0', frac = ''] = amount.split('.')
-  const padded = (frac + '0000000').slice(0, 7)
-  return BigInt(whole) * 10_000_000n + BigInt(padded)
 }
 
 // ---------------------------------------------------------------------------
@@ -126,12 +213,20 @@ class NulthClient {
   constructor(private readonly config: NulthClientConfig) {
     this.policy = { ...config.policy }
     this.prover = config.prover ?? 'mock'
-    if (config.network === 'mainnet') {
+    if (this.prover !== 'mock') {
       throw new RouteDockManifestError(
-        'NulthClient cannot use the insecure mock prover on mainnet; a production prover is required',
+        `NulthClient: unknown prover backend ${String(config.prover)}; only 'mock' is implemented`,
       )
     }
-    console.warn('NulthClient is using the insecure mock prover; proofs are not cryptographically sound')
+    if (config.network !== 'testnet') {
+      throw new RouteDockManifestError(
+        `NulthClient cannot use the insecure mock prover on mainnet; a production prover is required (network must be 'testnet', got ${String(config.network)})`,
+      )
+    }
+    resolveLogger(config.logger)(
+      'warn',
+      'NulthClient is using the insecure mock prover; proofs are not cryptographically sound',
+    )
   }
 
   get proverBackend(): string { return this.prover }
@@ -179,6 +274,12 @@ class NulthClient {
   }
 
   private enforcePolicy(context: PaymentAuthContext): void {
+    if (context.amountStroops < 0n) {
+      throw new RangeError(`Invalid amountStroops: ${context.amountStroops}`)
+    }
+    if (!Number.isSafeInteger(context.ledgerSequence) || context.ledgerSequence < 0) {
+      throw new RangeError(`Invalid ledgerSequence: ${context.ledgerSequence}`)
+    }
     if (this.policy.expiryLedger !== undefined && context.ledgerSequence > this.policy.expiryLedger) {
       throw new NulthPolicyError('session_expired', 'Nulth session expired')
     }
@@ -214,6 +315,7 @@ export function createNulthSigner(config: NulthSignerConfig): NulthStellarSigner
     signAuthEntry: async (authEntry) => {
       const ctx = config.paymentContext
       if (!ctx) throw new Error('Nulth paymentContext must be set before signing')
+      assertAuthEntryMatchesContext(authEntry, nulthAccount, ctx)
       const proof = client.buildPaymentAuthProof({ authEntry, ...ctx })
       return { signedAuthEntry: encodeAuthSignature(proof), signerAddress: nulthAccount }
     },
@@ -231,7 +333,7 @@ export function paymentContextFromManifest(
   manifest: {
     payee: string
     asset_contract: string
-    pricing: { x402?: { amount: string }; 'mpp-charge'?: { amount: string } }
+    pricing: { x402?: { amount: string; payee?: string }; 'mpp-charge'?: { amount: string; payee?: string } }
   },
   mode: 'x402' | 'mpp-charge',
   ledgerSequence: number,
@@ -239,7 +341,7 @@ export function paymentContextFromManifest(
   const pricing = manifest.pricing[mode]
   if (!pricing) throw new Error(`manifest.pricing.${mode} missing`)
   return {
-    payee: manifest.payee,
+    payee: pricing.payee ?? manifest.payee,
     amountStroops: usdcToStroops(pricing.amount),
     assetContract: manifest.asset_contract,
     ledgerSequence,

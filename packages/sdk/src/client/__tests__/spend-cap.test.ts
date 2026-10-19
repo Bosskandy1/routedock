@@ -17,7 +17,7 @@ import assert from 'node:assert/strict'
 import { Keypair } from '@stellar/stellar-sdk'
 import { RouteDockClient, usdcToMicros } from '../RouteDockClient.js'
 import { InMemorySpendStore, FileSpendStore } from '../../store/SpendStore.js'
-import { RouteDockPolicyRejectError } from '../../errors.js'
+import { RouteDockPolicyRejectError, RouteDockManifestError } from '../../errors.js'
 import { signManifest } from '../../manifest/sign.js'
 import type { RouteDockManifest, PaymentResult } from '../../types.js'
 import { join } from 'node:path'
@@ -310,6 +310,99 @@ function fakeResult(mode: string, amount: string): PaymentResult {
   }
 }
 
+// ── Test 4b: free x402 responses do not consume the spend cap ─────────────────
+
+// #325 (regression of #139): pay() reserves the manifest price before dispatch,
+// but an x402 route answering a plain 200 with no 402 challenge pays nothing and
+// returns { txHash: null, amount: '0' }. That reservation must be released, or
+// repeated free calls drain the local budget and eventually lock the client out.
+{
+  const { manifest } = makeManifest({ modes: ['x402'] })
+  const server = await startTestServer(makeManifestHandler(manifest))
+
+  try {
+    const store = new InMemorySpendStore({ warn: false })
+    const client = new RouteDockClient({
+      wallet: Keypair.random(),
+      network: 'testnet',
+      spendCap: {
+        daily: '0.0015',
+        asset: 'USDC',
+        endpointCaps: { [server.url]: '0.0015' },
+      },
+      spendStore: store,
+    })
+    stubTrustlineCache(client)
+
+    // x402 price is 0.001 (10000 microUSDC); the cap is 0.0015, so a leaked
+    // reservation fails the second call with RouteDockPolicyRejectError.
+    ;(client as any).x402.pay = async () => ({
+      data: { free: true },
+      txHash: null,
+      mode: 'x402',
+      amount: '0',
+      timestamp: Date.now(),
+    })
+
+    for (let i = 0; i < 3; i++) {
+      const result = await client.pay(`${server.url}/test`, { forceMode: 'x402' })
+      assert.equal(result.amount, '0', 'free response should report amount 0')
+    }
+
+    const state = await store.read()
+    assert.ok(state)
+    assert.equal(state.totalMicros, '0', 'free responses must not consume the daily cap')
+    assert.equal(
+      state.endpoints[server.url],
+      undefined,
+      'free responses must not consume the endpoint cap',
+    )
+
+    console.log('✓ Test 4b: free x402 responses release their reservation')
+  } finally {
+    await server.close()
+  }
+}
+
+// ── Test 4c: a paid x402 result still commits when the txHash is absent ───────
+
+// The rollback above keys on `txHash === null && amount === '0'`. A facilitator
+// may omit `X-Payment-Response`, leaving txHash null on a genuinely paid call,
+// so the amount must still be recorded.
+{
+  const { manifest } = makeManifest({ modes: ['x402'] })
+  const server = await startTestServer(makeManifestHandler(manifest))
+
+  try {
+    const store = new InMemorySpendStore({ warn: false })
+    const client = new RouteDockClient({
+      wallet: Keypair.random(),
+      network: 'testnet',
+      spendCap: { daily: '1.00', asset: 'USDC' },
+      spendStore: store,
+    })
+    stubTrustlineCache(client)
+
+    ;(client as any).x402.pay = async () => ({
+      data: { ok: true },
+      txHash: null,
+      mode: 'x402',
+      amount: '0.001',
+      timestamp: Date.now(),
+    })
+
+    await client.pay(`${server.url}/test`, { forceMode: 'x402' })
+
+    const state = await store.read()
+    assert.ok(state)
+    assert.equal(state.totalMicros, '10000', 'paid x402 spend must be recorded without a txHash')
+
+    console.log('✓ Test 4c: paid x402 spend is recorded even when txHash is absent')
+  } finally {
+    await server.close()
+  }
+}
+
 // ── Test 5: MPP session voucher spend consults the cap ────────────────────────
 
 // Test 5a: RouteDockClient passes onSpend to MppSessionClient when spendCap is set
@@ -515,6 +608,133 @@ function fakeResult(mode: string, amount: string): PaymentResult {
       rmSync(tmpPath)
     } catch {}
   }
+}
+
+// ── Test 10: endpointCaps keys are normalized to origin (Issue #414) ──────────
+
+{
+  const { manifest } = makeManifest()
+  const server = await startTestServer(makeManifestHandler(manifest))
+
+  try {
+    // A trailing slash must normalize to the same origin the runtime lookup
+    // uses (new URL(url).origin), so the cap configured under that form is
+    // still enforced end-to-end against a real request.
+    const trailingSlashKey = `${server.url}/`
+
+    const store = new InMemorySpendStore({ warn: false })
+    const client = new RouteDockClient({
+      wallet: Keypair.random(),
+      network: 'testnet',
+      spendCap: {
+        daily: '1.00',
+        asset: 'USDC',
+        endpointCaps: { [trailingSlashKey]: '0.0015' },
+      },
+      spendStore: store,
+    })
+    stubTrustlineCache(client)
+    ;(client as any).charge.pay = async () => fakeResult('mpp-charge', '0.0008')
+
+    await client.pay(`${server.url}/test`)
+
+    let threw = false
+    try {
+      await client.pay(`${server.url}/test`)
+    } catch (err) {
+      threw = true
+      assert.ok(err instanceof RouteDockPolicyRejectError)
+      assert.equal((err as RouteDockPolicyRejectError).reason, 'local_endpoint_cap_exceeded')
+    }
+    assert.ok(threw, `endpoint cap keyed "${trailingSlashKey}" should still be enforced against ${server.url}`)
+
+    // An uppercase host and an explicit default port must normalize to the
+    // same origin as their canonical form. server.url is a bare IP:port, so
+    // uppercasing it proves nothing — instead, pair each variant against the
+    // canonical "https://api.example.com" key and confirm the constructor
+    // rejects the collision, which is only possible if the variant actually
+    // normalized to that origin.
+    for (const variant of ['https://API.example.com', 'https://api.example.com:443']) {
+      assert.throws(
+        () =>
+          new RouteDockClient({
+            wallet: Keypair.random(),
+            network: 'testnet',
+            spendCap: {
+              daily: '1.00',
+              asset: 'USDC',
+              endpointCaps: { 'https://api.example.com': '0.10', [variant]: '0.20' },
+            },
+          }),
+        (err: unknown) =>
+          err instanceof RouteDockManifestError && err.message.includes('"https://api.example.com"'),
+        `"${variant}" should normalize to the same origin as "https://api.example.com"`,
+      )
+    }
+
+    console.log('✓ Test 10: endpointCaps keys normalize to origin (trailing slash, uppercase host, default port)')
+  } finally {
+    await server.close()
+  }
+}
+
+// ── Test 11: invalid endpointCaps keys throw at construction ─────────────────
+
+{
+  const invalidUrlThrew = (() => {
+    try {
+      new RouteDockClient({
+        wallet: Keypair.random(),
+        network: 'testnet',
+        spendCap: { daily: '1.00', asset: 'USDC', endpointCaps: { 'not a url': '0.10' } },
+      })
+      return false
+    } catch (err) {
+      return err instanceof RouteDockManifestError && (err as Error).message.includes('not a url')
+    }
+  })()
+  assert.ok(invalidUrlThrew, 'an unparseable endpointCaps key should throw a typed error naming the key')
+
+  const pathThrew = (() => {
+    try {
+      new RouteDockClient({
+        wallet: Keypair.random(),
+        network: 'testnet',
+        spendCap: {
+          daily: '1.00',
+          asset: 'USDC',
+          endpointCaps: { 'https://api.example.com/price': '0.10' },
+        },
+      })
+      return false
+    } catch (err) {
+      return err instanceof RouteDockManifestError
+    }
+  })()
+  assert.ok(pathThrew, 'an endpointCaps key with a path should throw')
+
+  const duplicateThrew = (() => {
+    try {
+      new RouteDockClient({
+        wallet: Keypair.random(),
+        network: 'testnet',
+        spendCap: {
+          daily: '1.00',
+          asset: 'USDC',
+          endpointCaps: {
+            'https://api.example.com': '0.10',
+            'https://API.example.com/': '0.20',
+          },
+        },
+      })
+      return false
+    } catch (err) {
+      return err instanceof RouteDockManifestError
+    }
+  })()
+  assert.ok(duplicateThrew, 'two endpointCaps keys normalizing to the same origin should throw')
+
+  console.log('✓ Test 11: invalid or ambiguous endpointCaps keys throw a typed config error')
 }
 
 console.log('\nAll spend-cap tests passed.')

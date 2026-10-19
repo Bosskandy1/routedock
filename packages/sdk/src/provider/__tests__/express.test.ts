@@ -6,8 +6,8 @@ import type { Request, Response } from 'express'
 import { Keypair } from '@stellar/stellar-sdk'
 import { routedock, type RouteDockMiddlewareOptions } from '../routedockMiddleware.js'
 import type { RouteDockManifest } from '../../types.js'
-import { InMemorySeenTxStore } from '../SeenTxStore.js'
-
+import { InMemorySeenTxStore, paymentIdempotencyKey } from '../SeenTxStore.js'
+import { usdcToStroops } from '../../internal/usdc.js'
 // Generate fresh keypairs — avoids hardcoding secrets while keeping tests self-contained
 const payeeKeypair = Keypair.random()
 const commitKeypair = Keypair.random()
@@ -260,19 +260,205 @@ describe('routedock (Express) — settlement idempotency', () => {
       onSettled: async (txHash: string) => { settled.push(txHash) },
     })
     try {
-      // Seed the store with a fake settlement record so the handler replays it
-      await seenStore.set('fake-key', {
+      const key = await paymentIdempotencyKey(
+        (n) => (n === 'payment-signature' ? 'SIG' : undefined),
+        {
+          method: 'GET',
+          path: '/price',
+          amount: String(usdcToStroops('0.001')),
+          payTo: payeeKeypair.publicKey(),
+        },
+      )
+      assert.ok(key)
+      await seenStore.set(key, {
         txHash: 'CACHED_TX_HASH',
         headers: { 'X-Payment-Response': 'cached-response' },
+        createdAt: Date.now(),
       })
 
-      // We can't easily generate a valid idempotency key from a fake header
-      // because paymentIdempotencyKey hashes the header. Instead, test the
-      // InMemorySeenTxStore directly in its own test file. Here we verify the
-      // handler doesn't crash when the store returns a cached value.
-      assert.ok(true, 'idempotency store was seeded without error')
+      const res = await fetch(`${url}/price`, {
+        headers: { 'payment-signature': 'SIG' },
+      })
+      assert.equal(res.status, 200)
+      const data = (await res.json()) as { price: string }
+      assert.equal(data.price, '42')
+      assert.equal(res.headers.get('x-payment-response'), 'cached-response')
+
+      await new Promise((r) => setImmediate(r))
+      assert.equal(settled.length, 0)
     } finally {
       await close()
+    }
+  })
+
+  it('replays cached settlement on duplicate authorization header (mpp-charge)', async () => {
+    const seenStore = new InMemorySeenTxStore()
+    const settled: string[] = []
+
+    const { url, close } = await makeServer({
+      modes: ['mpp-charge'],
+      pricing: { 'mpp-charge': '0.0008' },
+      seenTxStore: seenStore,
+      onSettled: async (txHash: string) => { settled.push(txHash) },
+    })
+    try {
+      const key = await paymentIdempotencyKey(
+        (n) => (n === 'authorization' ? 'Payment test-credential' : undefined),
+        {
+          method: 'GET',
+          path: '/price',
+          amount: '0.0008',
+          payTo: payeeKeypair.publicKey(),
+        },
+      )
+      assert.ok(key)
+      await seenStore.set(key, {
+        txHash: 'CACHED_TX_HASH',
+        headers: { 'X-Payment-Response': 'cached-response' },
+        createdAt: Date.now(),
+      })
+
+      const res = await fetch(`${url}/price`, {
+        headers: { authorization: 'Payment test-credential' },
+      })
+      assert.equal(res.status, 200)
+      const data = (await res.json()) as { price: string }
+      assert.equal(data.price, '42')
+      assert.equal(res.headers.get('x-payment-response'), 'cached-response')
+
+      await new Promise((r) => setImmediate(r))
+      assert.equal(settled.length, 0)
+
+      // A second replay of the same mpp-charge credential is spent.
+      const second = await fetch(`${url}/price`, {
+        headers: { authorization: 'Payment test-credential' },
+      })
+      assert.equal(second.status, 402)
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects the second replay with 402 and does not run the route handler again', async () => {
+    let handlerRuns = 0
+    const seenStore = new InMemorySeenTxStore({ warn: false })
+    const app = express()
+    app.use(
+      routedock({
+        ...BASE_OPTS,
+        modes: ['x402'],
+        pricing: { x402: '0.001' },
+        seenTxStore: seenStore,
+      } as Parameters<typeof routedock>[0]),
+    )
+    app.get('/price', (_req: Request, res: Response) => {
+      handlerRuns++
+      res.json({ price: '42' })
+    })
+    const server = createServer(app)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const addr = server.address() as { port: number }
+    const url = `http://127.0.0.1:${addr.port}`
+    try {
+      const key = await paymentIdempotencyKey(
+        (n) => (n === 'payment-signature' ? 'SIG' : undefined),
+        { method: 'GET', path: '/price', amount: String(usdcToStroops('0.001')), payTo: payeeKeypair.publicKey() },
+      )
+      assert.ok(key)
+      await seenStore.set(key, { txHash: 'TX', createdAt: Date.now() })
+
+      const first = await fetch(`${url}/price`, { headers: { 'payment-signature': 'SIG' } })
+      assert.equal(first.status, 200)
+      const second = await fetch(`${url}/price`, { headers: { 'payment-signature': 'SIG' } })
+      assert.equal(second.status, 402)
+      const body = (await second.json()) as { error: string }
+      assert.equal(body.error, 'Payment already used')
+      assert.equal(handlerRuns, 1)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+
+  it('rejects a settlement older than the replay window', async () => {
+    const seenStore = new InMemorySeenTxStore({ warn: false })
+    const { url, close } = await makeServer({
+      modes: ['x402'],
+      pricing: { x402: '0.001' },
+      seenTxStore: seenStore,
+    })
+    try {
+      const key = await paymentIdempotencyKey(
+        (n) => (n === 'payment-signature' ? 'SIG' : undefined),
+        { method: 'GET', path: '/price', amount: String(usdcToStroops('0.001')), payTo: payeeKeypair.publicKey() },
+      )
+      assert.ok(key)
+      await seenStore.set(key, {
+        txHash: 'TX',
+        headers: { 'X-Payment-Response': 'cached-response' },
+        createdAt: Date.now() - 61_000,
+      })
+
+      const res = await fetch(`${url}/price`, { headers: { 'payment-signature': 'SIG' } })
+      assert.equal(res.status, 402)
+    } finally {
+      await close()
+    }
+  })
+
+  it('does not replay a payment settled on a different route against a shared store', async () => {
+    const seenStore = new InMemorySeenTxStore({ warn: false })
+    const runs = { cheap: 0, expensive: 0 }
+    const app = express()
+    app.use(
+      '/cheap',
+      routedock({
+        ...BASE_OPTS,
+        modes: ['x402'],
+        pricing: { x402: '0.001' },
+        seenTxStore: seenStore,
+      } as Parameters<typeof routedock>[0]),
+    )
+    app.use(
+      '/expensive',
+      routedock({
+        ...BASE_OPTS,
+        modes: ['x402'],
+        pricing: { x402: '5.00' },
+        seenTxStore: seenStore,
+      } as Parameters<typeof routedock>[0]),
+    )
+    app.get('/cheap', (_req: Request, res: Response) => {
+      runs.cheap++
+      res.json({ price: 'cheap' })
+    })
+    app.get('/expensive', (_req: Request, res: Response) => {
+      runs.expensive++
+      res.json({ price: 'expensive' })
+    })
+    const server = createServer(app)
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const addr = server.address() as { port: number }
+    const url = `http://127.0.0.1:${addr.port}`
+    try {
+      // Seed a settlement for the cheap route only.
+      const cheapKey = await paymentIdempotencyKey(
+        (n) => (n === 'payment-signature' ? 'SIG' : undefined),
+        { method: 'GET', path: '/cheap', amount: String(usdcToStroops('0.001')), payTo: payeeKeypair.publicKey() },
+      )
+      assert.ok(cheapKey)
+      await seenStore.set(cheapKey, { txHash: 'TX', createdAt: Date.now() })
+
+      // Request /expensive before /cheap: the reverse order hides a header-only
+      // key behind the replay cap instead of the route scope.
+      const expensiveRes = await fetch(`${url}/expensive`, { headers: { 'payment-signature': 'SIG' } })
+      assert.notEqual(expensiveRes.status, 200)
+      assert.equal(runs.expensive, 0)
+
+      const cheapRes = await fetch(`${url}/cheap`, { headers: { 'payment-signature': 'SIG' } })
+      assert.equal(cheapRes.status, 200)
+      assert.equal(runs.cheap, 1)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
     }
   })
 })

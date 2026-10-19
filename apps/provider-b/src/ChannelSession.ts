@@ -7,6 +7,8 @@ import {
   mppSessionWsVerified,
   registerProvider,
   signManifest,
+  reconcileAbandonedSessions,
+  type ReconciliationStats,
 } from '@routedock/routedock/provider/hono'
 import { Store } from '@stellar/mpp/channel/server'
 import {
@@ -17,18 +19,8 @@ import {
   type Network,
 } from './manifest.js'
 import type { Env } from './env.js'
-
-/**
- * Mirrors the SDK's OrphanedSessionInfo. Declared locally because the type is
- * only re-exported from `@routedock/routedock/provider`, the Node-only Express
- * entry point, which must not appear in a Workers bundle.
- */
-interface OrphanedSessionInfo {
-  cumulativeAmount: string
-  lastSignature: string
-  voucherCount: number
-  reason: 'connection-closed' | 'idle-timeout'
-}
+import { createSessionWriters } from './sessionWrites.js'
+import { resolveAssetContract } from './config.js'
 
 interface OrderBookLevel {
   price: string
@@ -75,7 +67,7 @@ export class ChannelSession extends DurableObject<Env> {
   private buildApp(): Hono {
     const env = this.env
     const network: Network = env.STELLAR_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'
-    const assetContract = env.USDC_ASSET_CONTRACT ?? ''
+    const assetContract = resolveAssetContract(env, network)
     const channelContract = env.CHANNEL_CONTRACT_ID ?? ''
 
     // mpp-session cannot verify a voucher without the commitment key, so fail
@@ -109,6 +101,13 @@ export class ChannelSession extends DurableObject<Env> {
 
     const providerUrl = `${env.PUBLIC_BASE_URL ?? 'https://api-b.routedock.xyz'}/stream/orderbook`
 
+    const sessionWriters = createSessionWriters(supabase, {
+      payee: env.STELLAR_PAYEE_ADDRESS,
+      network,
+      channelContract,
+      providerUrl,
+    })
+
     const sessionStore = this.ctx?.storage
       ? Store.from({
           get: (key: string) => this.ctx.storage.get(key),
@@ -135,73 +134,7 @@ export class ChannelSession extends DurableObject<Env> {
         commitmentPublicKey,
         sessionStore,
         manifest,
-        onSessionOpen: async (channelId, payer) => {
-          if (!supabase) return
-          const { error } = await supabase.from('sessions').insert({
-            channel_id: channelId,
-            payee: env.STELLAR_PAYEE_ADDRESS,
-            payer: payer ?? 'unknown',
-            cumulative_amount: '0',
-            status: 'open',
-            channel_contract: channelId,
-            network,
-            voucher_count: 0,
-          })
-          if (error) console.error('[supabase] session insert failed:', error.message)
-        },
-        onVoucher: async (channelId, voucherIndex, cumulativeAmount, signature) => {
-          if (!supabase) return
-          const { error } = await supabase
-            .from('sessions')
-            .update({
-              cumulative_amount: cumulativeAmount,
-              voucher_count: voucherIndex,
-              last_signature: signature,
-            })
-            .eq('channel_id', channelId)
-          if (error) console.error('[supabase] voucher update failed:', error.message)
-        },
-        onOrphaned: async (channelId: string, info: OrphanedSessionInfo) => {
-          if (!supabase) return
-          const { error } = await supabase
-            .from('sessions')
-            .update({
-              status: 'closing',
-              cumulative_amount: info.cumulativeAmount,
-              last_signature: info.lastSignature || null,
-              voucher_count: info.voucherCount,
-            })
-            .eq('channel_id', channelId)
-          if (error) console.error('[supabase] orphan update failed:', error.message)
-          else console.log(`[supabase] session marked closing (${info.reason}): ${channelId}`)
-        },
-        onSettled: async (txHash, totalPaid, mode, payer) => {
-          console.log(`[settled] mode=${mode} txHash=${txHash} totalPaid=${totalPaid}`)
-          if (!supabase) return
-
-          // Matched on channel_id, not channel_contract. The Express build
-          // closed by `.eq('channel_contract', CHANNEL_CONTRACT_ID)` plus
-          // `status='open'`, which closes an arbitrary row as soon as two
-          // sessions share a channel contract.
-          const { error: closeErr } = await supabase
-            .from('sessions')
-            .update({ status: 'closed', settlement_tx_hash: txHash })
-            .eq('channel_id', channelContract)
-            .eq('status', 'open')
-          if (closeErr) console.error('[supabase] session close failed:', closeErr.message)
-
-          const { error } = await supabase.from('tx_log').insert({
-            tx_type: 'channel_close',
-            tx_hash: txHash,
-            amount: parseFloat(totalPaid),
-            mode,
-            network,
-            provider_url: providerUrl,
-            agent_address: payer,
-            metadata: { settled_at: new Date().toISOString() },
-          })
-          if (error) console.error('[supabase] tx_log insert failed:', error.message)
-        },
+        ...sessionWriters,
       }),
     )
 
@@ -235,6 +168,12 @@ export class ChannelSession extends DurableObject<Env> {
     app.get(
       '/stream/orderbook',
       upgradeWebSocket((c) => {
+        // Hono runs this callback before it checks the Upgrade header, so a
+        // plain mpp-session GET lands here too. Return no events and let the
+        // helper fall through to the HTTP route below.
+        if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') {
+          return {}
+        }
         // Never upgrade a handshake the payment middleware did not verify.
         // (The middleware returns 402 before reaching this route, so this is
         // defense in depth against misconfiguration — fail fast rather than
@@ -287,8 +226,48 @@ export class ChannelSession extends DurableObject<Env> {
     return app
   }
 
+  async reconcileSessions(): Promise<ReconciliationStats | null> {
+    const env = this.env
+    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.STELLAR_PAYEE_SECRET) {
+      return null
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY)
+    const network: Network = env.STELLAR_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'
+    const providerUrl = `${env.PUBLIC_BASE_URL ?? 'https://api-b.routedock.xyz'}/stream/orderbook`
+
+    return reconcileAbandonedSessions({
+      supabase,
+      network,
+      payeeSecretKey: env.STELLAR_PAYEE_SECRET,
+      onRecovered: async (channelId: string, txHash: string, totalPaid: string) => {
+        console.log(`[reconcile] Recovered channel ${channelId} with tx ${txHash} for ${totalPaid} USDC`)
+        const { error } = await supabase.from('tx_log').insert({
+          tx_type: 'channel_close',
+          tx_hash: txHash,
+          amount: parseFloat(totalPaid),
+          mode: 'mpp-session',
+          network,
+          provider_url: providerUrl,
+          metadata: { settled_at: new Date().toISOString(), recovered: true },
+        })
+        if (error) {
+          console.error('[supabase] tx_log insert on reconcile failed:', error.message)
+        }
+      },
+    })
+  }
+
   override async fetch(request: Request): Promise<Response> {
-    this.app ??= this.buildApp()
+    if (!this.app) {
+      try {
+        this.app = this.buildApp()
+      } catch (err) {
+        console.error('[startup]', err)
+        return Response.json({ error: 'Provider misconfigured' }, { status: 500 })
+      }
+    }
     return this.app.fetch(request)
   }
 }
+

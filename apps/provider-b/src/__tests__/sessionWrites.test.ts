@@ -39,6 +39,22 @@ function makeSupabaseMock(rows: Row[]) {
         if (name === 'sessions') rows.push({ ...payload })
         return Promise.resolve({ data: null, error: null })
       },
+      upsert(
+        payload: Record<string, unknown>,
+        options?: { onConflict?: string; ignoreDuplicates?: boolean },
+      ) {
+        inserts.push({ table: name, payload })
+        if (name === 'sessions') {
+          const conflict = options?.onConflict ?? 'channel_id'
+          const existing = rows.find((row) => row[conflict] === payload[conflict])
+          if (!existing) {
+            rows.push({ ...payload })
+          } else if (!options?.ignoreDuplicates) {
+            Object.assign(existing, payload)
+          }
+        }
+        return Promise.resolve({ data: null, error: null })
+      },
       update(payload: Record<string, unknown>) {
         updates.push({ table: name, payload })
         const filters: Array<(row: Row) => boolean> = []
@@ -204,5 +220,72 @@ describe('provider-b sessionWrites', () => {
     assert.equal(rows[1]!['settlement_tx_hash'], 'old-hash')
     assert.equal(inserts.length, 1)
     assert.equal(inserts[0]!.table, 'tx_log')
+  })
+})
+
+describe('provider-b sessionWrites per-channel state', () => {
+  it('is idempotent when onSessionOpen repeats for the same channel', async () => {
+    const { client, rows, inserts } = makeSupabaseMock([])
+    const writers = createSessionWriters(client, CONFIG)
+
+    const { errors } = await captureConsole(async () => {
+      await writers.onSessionOpen(CHANNEL_ID, 'GPAYER')
+      await writers.onVoucher(CHANNEL_ID, 1, '0.0001000', 'aa')
+      await writers.onSessionOpen(CHANNEL_ID, 'GPAYER')
+    })
+
+    assert.equal(rows.length, 1, 'a repeated open must not create a second row')
+    assert.equal(rows[0]!['cumulative_amount'], '0.0001000')
+    assert.equal(rows[0]!['voucher_count'], 1)
+    assert.equal(inserts.length, 2)
+    assert.equal(errors.length, 0)
+  })
+
+  it('keeps two channels in two independent session rows', async () => {
+    const secondChannel = 'CWRONGNETWORK'
+    const { client, rows, inserts } = makeSupabaseMock([])
+    const writers = createSessionWriters(client, CONFIG)
+
+    const { errors } = await captureConsole(async () => {
+      await writers.onSessionOpen(CHANNEL_ID, 'GPAYER_A')
+      await writers.onVoucher(CHANNEL_ID, 1, '0.0001000', 'aa')
+      await writers.onSessionOpen(secondChannel, 'GPAYER_B')
+      await writers.onVoucher(secondChannel, 1, '0.0002000', 'bb')
+    })
+
+    assert.equal(rows.length, 2)
+    const first = rows.find((row) => row['channel_id'] === CHANNEL_ID)
+    const second = rows.find((row) => row['channel_id'] === secondChannel)
+    assert.equal(first?.['cumulative_amount'], '0.0001000')
+    assert.equal(second?.['cumulative_amount'], '0.0002000')
+    assert.equal(inserts.length, 2)
+    assert.equal(errors.length, 0)
+  })
+
+  it('closes the channel named by onSettled rather than the configured contract', async () => {
+    const otherChannel = 'COTHERCHANNEL'
+    const otherRow: Row = {
+      channel_id: otherChannel,
+      status: 'open',
+      cumulative_amount: '0.0001000',
+      settlement_tx_hash: null,
+    }
+    const defaultRow: Row = {
+      channel_id: CHANNEL_ID,
+      status: 'open',
+      cumulative_amount: '0.0001000',
+      settlement_tx_hash: null,
+    }
+    const { client, rows, inserts } = makeSupabaseMock([defaultRow, otherRow])
+    const writers = createSessionWriters(client, CONFIG)
+
+    await captureConsole(async () => {
+      await writers.onSettled('tx-other', '0.0001000', 'mpp-session', 'GPAYER', otherChannel)
+    })
+
+    assert.equal(rows[0]!['status'], 'open', 'the default channel must remain open')
+    assert.equal(rows[1]!['status'], 'closed')
+    assert.equal(rows[1]!['settlement_tx_hash'], 'tx-other')
+    assert.equal(inserts.length, 1)
   })
 })

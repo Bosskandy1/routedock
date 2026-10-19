@@ -25,7 +25,7 @@ import {
   withTypedChannelErrors,
   type ChannelVerifyCredential,
 } from './mppCompatibility.js'
-import type { Method } from 'mppx'
+import { Credential, type Method } from 'mppx'
 import { type ChannelStore, type OrphanedSessionInfo } from './MppSessionHandler.js'
 import { base64ToUtf8, hexToBytes } from './encoding.js'
 import {
@@ -64,7 +64,7 @@ export interface RouteDockHonoOptions {
   facilitatorApiKey?: string
   commitmentPublicKey?: string
   manifest: RouteDockManifest
-  onSettled?: (txHash: string, amount: string, mode: string, payer: string | null) => Promise<void>
+  onSettled?: (txHash: string, amount: string, mode: string, payer: string | null, channelId?: string) => Promise<void>
   onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
   onCallbackError?: (err: unknown, cbName: string) => void
@@ -479,12 +479,16 @@ interface SignalContext {
  * DELETE close see only the vouchers of whichever handler received it.
  */
 interface MppSessionHandlerState {
-  /** mppx server instance (channel method) used for voucher verification. */
+  /** Default mppx server instance (the configured channel). */
   mppx: unknown
+  /** mppx instance verifying the channel named by a credential. */
+  mppxFor(channelId: string): unknown
+  /** The actual channel named by the request's credential, else the default. */
+  channelIdForRequest(request: globalThis.Request): string
   /** Handle a DELETE channel-close request; returns the HTTP response. */
   handleDelete(c: DeleteContext): Promise<Response>
-  /** Arm the connection-closed orphan guard (idempotent). */
-  armAbortGuard(c: SignalContext): void
+  /** Arm the connection-closed orphan guard (idempotent per channel). */
+  armAbortGuard(c: SignalContext, channelId: string): void
 }
 
 /** The last verified voucher: amount, its signature, and the payer it named. */
@@ -502,35 +506,66 @@ function createMppSessionHandlerState(
   const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
   const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
   const logger = resolveLogger(opts.logger)
-  const voucherRecordKey = `routedock:session:voucher:${sessionPricing.channelFactory}`
+  // `channelFactory` is the provider's default (and advertised) channel. A
+  // verified credential may name a different on-chain channel — one agent per
+  // channel — so all session state below is keyed by the channel the credential
+  // actually named, never by this static default.
+  const defaultChannelId = sessionPricing.channelFactory
 
   const innerStore = opts.sessionStore ?? Store.memory()
-  // The last voucher mppx actually verified — amount, its signature, and the
-  // payer it named. Only `commit` (called after a successful verify) may set
-  // this; nothing derived from an unverified header may reach it.
-  let record: VerifiedVoucherRecord | null = null
-  let voucherCount = 0
-  let sessionOpened = false
-  let idleTimer: ReturnType<typeof setTimeout> | null = null
-  let settledCleanly = false
-  let abortListenerArmed = false
 
-  function clearIdleTimer(): void {
-    if (idleTimer) {
-      clearTimeout(idleTimer)
-      idleTimer = null
+  interface ChannelState {
+    /** Last voucher mppx actually verified for this channel. */
+    record: VerifiedVoucherRecord | null
+    voucherCount: number
+    sessionOpened: boolean
+    idleTimer: ReturnType<typeof setTimeout> | null
+    settledCleanly: boolean
+    abortListenerArmed: boolean
+  }
+
+  // One entry per verified channel, so a second agent's vouchers can never
+  // merge into the first agent's record even when both hit one handler/DO.
+  const channelStates = new Map<string, ChannelState>()
+  const knownChannelIds = new Set<string>()
+
+  function stateFor(channelId: string): ChannelState {
+    let state = channelStates.get(channelId)
+    if (!state) {
+      state = {
+        record: null,
+        voucherCount: 0,
+        sessionOpened: false,
+        idleTimer: null,
+        settledCleanly: false,
+        abortListenerArmed: false,
+      }
+      channelStates.set(channelId, state)
+      knownChannelIds.add(channelId)
+    }
+    return state
+  }
+
+  function voucherRecordKey(channelId: string): string {
+    return `routedock:session:voucher:${channelId}`
+  }
+
+  function clearIdleTimer(state: ChannelState): void {
+    if (state.idleTimer) {
+      clearTimeout(state.idleTimer)
+      state.idleTimer = null
     }
   }
 
-  function armIdleTimer(): void {
+  function armIdleTimer(state: ChannelState, channelId: string): void {
     if (!opts.idleTimeoutMs) return
-    clearIdleTimer()
-    idleTimer = setTimeout(() => {
-      void flagOrphan('idle-timeout')
+    clearIdleTimer(state)
+    state.idleTimer = setTimeout(() => {
+      void flagOrphan(channelId, 'idle-timeout')
     }, opts.idleTimeoutMs)
     // `unref` exists on Node's Timeout but not the Web `number` handle — call it
     // defensively so the timer never keeps a Node process alive.
-    const maybeUnref = idleTimer as unknown as { unref?: () => void }
+    const maybeUnref = state.idleTimer as unknown as { unref?: () => void }
     if (typeof maybeUnref.unref === 'function') maybeUnref.unref()
   }
 
@@ -539,38 +574,50 @@ function createMppSessionHandlerState(
   // loses it even though `commit` persisted it to `innerStore` — so any path
   // that reads `record` must first try to reload it from the store. Never
   // overwrites an in-memory record that is already set.
-  async function loadPersistedRecord(): Promise<VerifiedVoucherRecord | null> {
-    if (record) return record
+  async function loadPersistedRecord(
+    state: ChannelState,
+    channelId: string,
+  ): Promise<VerifiedVoucherRecord | null> {
+    if (state.record) return state.record
     try {
-      const stored = (await innerStore.get(voucherRecordKey)) as
+      const stored = (await innerStore.get(voucherRecordKey(channelId))) as
         | { amount?: string; signature?: string; payer?: string | null }
         | undefined
       if (!stored || typeof stored.amount !== 'string' || typeof stored.signature !== 'string') {
         return null
       }
-      record = { amount: BigInt(stored.amount), signature: stored.signature, payer: stored.payer ?? null }
+      state.record = {
+        amount: BigInt(stored.amount),
+        signature: stored.signature,
+        payer: stored.payer ?? null,
+      }
     } catch {
       // Corrupt or unreadable persisted record — proceed as though there is none.
       return null
     }
-    return record
+    return state.record
   }
 
   // Flag an open-but-unsettled session for the reconciler. Idempotent.
-  async function flagOrphan(reason: 'connection-closed' | 'idle-timeout'): Promise<void> {
-    await loadPersistedRecord()
-    if (!sessionOpened || settledCleanly) return
-    sessionOpened = false
-    abortListenerArmed = false
-    clearIdleTimer()
+  async function flagOrphan(
+    channelId: string,
+    reason: 'connection-closed' | 'idle-timeout',
+  ): Promise<void> {
+    const state = stateFor(channelId)
+    await loadPersistedRecord(state, channelId)
+    if (!state.sessionOpened || state.settledCleanly) return
+    state.sessionOpened = false
+    state.abortListenerArmed = false
+    clearIdleTimer(state)
 
+    const record = state.record
     const cumulativeAmount = record ? (Number(record.amount) / 1e7).toFixed(7) : '0.0000000'
     if (opts.onOrphaned) {
       try {
-        await opts.onOrphaned(sessionPricing.channelFactory, {
+        await opts.onOrphaned(channelId, {
           cumulativeAmount,
           lastSignature: record?.signature ?? '',
-          voucherCount,
+          voucherCount: state.voucherCount,
           reason,
         })
       } catch (err) {
@@ -593,12 +640,14 @@ function createMppSessionHandlerState(
   }
 
   // Called only after mppx has verified a credential — never before. Commits
-  // the verified amount/signature/payer as the new record, then runs the
-  // bookkeeping (voucher count, idle timer, onSessionOpen/onVoucher) that used
-  // to run inside the store's `put`, before the caller knew verification had
-  // actually succeeded.
+  // the verified amount/signature/payer as the new record for the channel the
+  // credential named, then runs the bookkeeping (voucher count, idle timer,
+  // onSessionOpen/onVoucher) that used to run inside the store's `put`, before
+  // the caller knew verification had actually succeeded.
   async function commit(credential: ChannelVerifyCredential): Promise<void> {
-    await loadPersistedRecord()
+    const channelId = channelIdFromCredential(credential, defaultChannelId)
+    const state = stateFor(channelId)
+    await loadPersistedRecord(state, channelId)
     const payload = credential.payload
     if (typeof payload?.amount !== 'string' || typeof payload.signature !== 'string') return
     let amount: bigint
@@ -608,26 +657,26 @@ function createMppSessionHandlerState(
       return
     }
     // A late/duplicate commit can't roll the signature back to an earlier amount.
-    if (record && amount < record.amount) return
+    if (state.record && amount < state.record.amount) return
 
-    const payer = record?.payer ?? extractPayerAddress(credential.source)
-    record = { amount, signature: payload.signature, payer }
-    await innerStore.put(voucherRecordKey, {
-      amount: record.amount.toString(),
-      signature: record.signature,
-      payer: record.payer,
+    const payer = state.record?.payer ?? extractPayerAddress(credential.source)
+    state.record = { amount, signature: payload.signature, payer }
+    await innerStore.put(voucherRecordKey(channelId), {
+      amount: state.record.amount.toString(),
+      signature: state.record.signature,
+      payer: state.record.payer,
     })
 
-    voucherCount++
+    state.voucherCount++
     // Voucher activity — this session is alive again.
-    settledCleanly = false
-    armIdleTimer()
+    state.settledCleanly = false
+    armIdleTimer(state, channelId)
 
-    if (!sessionOpened) {
-      sessionOpened = true
+    if (!state.sessionOpened) {
+      state.sessionOpened = true
       if (opts.onSessionOpen) {
         Promise.resolve()
-          .then(() => opts.onSessionOpen!(sessionPricing.channelFactory, record!.payer))
+          .then(() => opts.onSessionOpen!(channelId, state.record!.payer))
           .catch((err) => {
             logger('error', '[mpp-session] onSessionOpen callback error', { error: err })
             opts.onCallbackError?.(err, 'onSessionOpen')
@@ -636,44 +685,121 @@ function createMppSessionHandlerState(
     }
 
     if (opts.onVoucher) {
-      const humanAmount = (Number(record.amount) / 1e7).toFixed(7)
-      Promise.resolve().then(() => opts.onVoucher!(sessionPricing.channelFactory, voucherCount, humanAmount, record!.signature)).catch(err => {
+      const humanAmount = (Number(state.record.amount) / 1e7).toFixed(7)
+      Promise.resolve().then(() => opts.onVoucher!(channelId, state.voucherCount, humanAmount, state.record!.signature)).catch(err => {
         logger('error', '[mpp-session] onVoucher callback error', { error: err })
         opts.onCallbackError?.(err, 'onVoucher')
       })
     }
   }
 
-  const mppx = Mppx.create({
-    secretKey: opts.payeeSecretKey,
-    methods: [
-      withTypedChannelErrors(
-        onVerifiedCredential(
-          mppChannel({
-            channel: sessionPricing.channelFactory,
-            commitmentKey: opts.commitmentPublicKey!,
-            network: networkId,
-            store: wrappedStore,
-            sourceAccount: payeeKeypair.publicKey(),
-            feePayer: channelAuthorizer(payeeKeypair),
-          }) as Method.AnyServer,
-          commit,
+  // Mppx verifies against a specific channel contract, so keep one instance per
+  // channel. The default is created eagerly (unchanged construction behavior);
+  // a credential that names another channel gets a lazily-created instance for
+  // that channel on first use.
+  function createMppx(channelId: string): unknown {
+    return Mppx.create({
+      secretKey: opts.payeeSecretKey,
+      methods: [
+        withTypedChannelErrors(
+          onVerifiedCredential(
+            mppChannel({
+              channel: channelId,
+              commitmentKey: opts.commitmentPublicKey!,
+              network: networkId,
+              store: wrappedStore,
+              sourceAccount: payeeKeypair.publicKey(),
+              feePayer: channelAuthorizer(payeeKeypair),
+            }) as Method.AnyServer,
+            commit,
+          ),
         ),
-      ),
-    ],
-  })
+      ],
+    })
+  }
+
+  const mppxByChannel = new Map<string, unknown>()
+  const mppx = createMppx(defaultChannelId)
+  mppxByChannel.set(defaultChannelId, mppx)
+
+  function mppxFor(channelId: string): unknown {
+    const existing = mppxByChannel.get(channelId)
+    if (existing) return existing
+    const created = createMppx(channelId)
+    mppxByChannel.set(channelId, created)
+    return created
+  }
+
+  function channelIdForRequest(request: globalThis.Request): string {
+    try {
+      const credential = Credential.fromRequest(request) as ChannelVerifyCredential
+      return channelIdFromCredential(credential, defaultChannelId)
+    } catch {
+      // No usable credential yet — issue the default channel's challenge.
+      return defaultChannelId
+    }
+  }
+
+  function resolveDeleteChannelId(body: {
+    amount?: string
+    signature?: string
+    channel?: unknown
+    channelId?: unknown
+    channel_id?: unknown
+  } | undefined): string {
+    for (const named of [body?.channelId, body?.channel_id, body?.channel]) {
+      if (typeof named === 'string' && named.length > 0) return named
+    }
+    // Backwards compatibility: a close that names no channel (the pre-fix
+    // protocol) targets the only channel this handler knows about.
+    if (knownChannelIds.size === 1) return knownChannelIds.values().next().value!
+    // Otherwise identify the record by its verified signature/amount. Only a
+    // unique match is safe; anything ambiguous falls back to the default.
+    if (body?.signature) {
+      const matches = [...knownChannelIds].filter(
+        (id) => stateFor(id).record?.signature === body.signature,
+      )
+      if (matches.length === 1) return matches[0]!
+    }
+    if (body?.amount) {
+      const amount = (() => {
+        try { return BigInt(body.amount) } catch { return null }
+      })()
+      if (amount !== null) {
+        const matches = [...knownChannelIds].filter(
+          (id) => stateFor(id).record?.amount === amount,
+        )
+        if (matches.length === 1) return matches[0]!
+      }
+    }
+    return defaultChannelId
+  }
 
   return {
     mppx,
 
+    mppxFor,
+
+    channelIdForRequest,
+
     async handleDelete(c: DeleteContext): Promise<Response> {
-      await loadPersistedRecord()
-      let body: { amount?: string; signature?: string } | undefined
+      let body: {
+        amount?: string
+        signature?: string
+        channel?: unknown
+        channelId?: unknown
+        channel_id?: unknown
+      } | undefined
       try {
-        body = await c.req.json() as { amount?: string; signature?: string }
+        body = await c.req.json() as typeof body
       } catch {
         // empty or non-JSON body
       }
+
+      const channelId = resolveDeleteChannelId(body)
+      const state = stateFor(channelId)
+      await loadPersistedRecord(state, channelId)
+      const record = state.record
 
       const bodyAmount = body?.amount ? BigInt(body.amount) : 0n
       const recordAmount = record?.amount ?? 0n
@@ -695,7 +821,7 @@ function createMppSessionHandlerState(
 
       if (closeAmount > 0n && closeSig) {
         const closeTxHash = await channelClose({
-          channel: sessionPricing.channelFactory,
+          channel: channelId,
           amount: closeAmount,
           signature: hexToBytes(closeSig),
           feePayer: channelAuthorizer(payeeKeypair),
@@ -706,24 +832,24 @@ function createMppSessionHandlerState(
         // after the close broadcast succeeded: if channelClose throws, the
         // orphan state must stay armed so the reconciler can still recover
         // this channel. Matches MppSessionHandler.ts ordering.
-        settledCleanly = true
-        clearIdleTimer()
+        state.settledCleanly = true
+        clearIdleTimer(state)
 
         const closePayer = record?.payer ?? null
 
         if (opts.onSettled) {
           const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
-          Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, reportMode, closePayer)).catch(err => {
+          Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, reportMode, closePayer, channelId)).catch(err => {
             logger('error', '[mpp-session] onSettled callback error', { error: err })
             opts.onCallbackError?.(err, 'onSettled')
           })
         }
 
-        sessionOpened = false
-        voucherCount = 0
-        record = null
-        await innerStore.delete(voucherRecordKey)
-        abortListenerArmed = false
+        state.sessionOpened = false
+        state.voucherCount = 0
+        state.record = null
+        await innerStore.delete(voucherRecordKey(channelId))
+        state.abortListenerArmed = false
 
         return c.json({ closeTxHash })
       }
@@ -731,22 +857,41 @@ function createMppSessionHandlerState(
       return c.json({ closeTxHash: null, message: 'no vouchers received' })
     },
 
-    armAbortGuard(c: SignalContext): void {
+    armAbortGuard(c: SignalContext, channelId: string): void {
       // Payment verified. The Workers/edge runtime exposes connection teardown
       // via the request's AbortSignal — use it (in place of Node's
       // `req.on('close')`) so a client crash mid-session flags the channel for
       // the reconciler instead of leaking state.
+      const state = stateFor(channelId)
       const signal = c.req.raw.signal
-      if (signal && !abortListenerArmed) {
-        abortListenerArmed = true
+      if (signal && !state.abortListenerArmed) {
+        state.abortListenerArmed = true
         signal.addEventListener(
           'abort',
-          () => { void flagOrphan('connection-closed') },
+          () => { void flagOrphan(channelId, 'connection-closed') },
           { once: true },
         )
       }
     },
   }
+}
+
+/**
+ * The actual channel named by an mppx credential (the echoed challenge's
+ * `request.channel`). Falls back to the provider's configured default when the
+ * credential does not name one, so old callers keep working.
+ */
+function channelIdFromCredential(credential: ChannelVerifyCredential, fallback: string): string {
+  const candidates = [
+    credential.channel,
+    credential.challenge?.request?.channel,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim()
+    }
+  }
+  return fallback
 }
 
 function createMppSessionHonoHandler(
@@ -761,8 +906,9 @@ function createMppSessionHonoHandler(
         return state.handleDelete(c as unknown as DeleteContext)
       }
 
+      const requestChannelId = state.channelIdForRequest(c.req.raw)
       const result = await (
-        state.mppx as unknown as {
+        state.mppxFor(requestChannelId) as unknown as {
           channel: (o: { amount: string; description?: string }) => (
             r: globalThis.Request,
           ) => Promise<{
@@ -783,7 +929,7 @@ function createMppSessionHonoHandler(
         return new Response(await challenge.text(), { status: 402, headers })
       }
 
-      state.armAbortGuard(c as unknown as SignalContext)
+      state.armAbortGuard(c as unknown as SignalContext, requestChannelId)
 
       // mpp-session-ws: the verified request is a WebSocket handshake, so hand
       // control to the app's upgrade route (it checks MPP_SESSION_WS_VERIFIED)

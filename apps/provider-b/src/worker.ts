@@ -5,8 +5,18 @@ export { ChannelSession } from './ChannelSession.js'
 
 /**
  * Edge entry point. Everything that touches session state is forwarded to a
- * single Durable Object, named after the channel contract, so all vouchers for
- * a channel serialize through one instance with shared memory.
+ * single Durable Object, named after the configured default channel. That
+ * object holds a map of per-channel state keyed by the actual channel each
+ * verified credential names (see `createMppSessionHandlerState`), so two agents
+ * paying through two deployed channels do not share a voucher record or a
+ * `sessions` row.
+ *
+ * We deliberately keep one object rather than `idFromName(actualChannelId)`:
+ * the worker forwards the request before payment verification, and a DELETE
+ * close may name no channel at all (the SDK resolves it from tracked state).
+ * Routing by actual channel would therefore require parsing/trusting an
+ * unverified credential at the edge, while the SDK's per-channel map gives the
+ * same isolation once verification has happened.
  *
  * `/health` is answered here because it reads no session state and should stay
  * up even if the object is busy.

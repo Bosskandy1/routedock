@@ -49,11 +49,16 @@ interface OrderBookResponse {
  * values. That is the exact protection the SDK added, defeated by the runtime.
  *
  * A Durable Object restores the single-process assumption the SDK is written
- * against: one instance per channel contract, serialized execution, and memory
- * that persists between requests.
+ * against: serialized execution and memory that persists between requests.
+ * There is one object per provider deployment, not one per channel: the SDK
+ * keeps a map of session state keyed by the actual channel named by each
+ * verified credential, so multiple agents/channels stay isolated inside this
+ * one object. (The edge cannot know the channel before verification, and a
+ * DELETE close may not name one — see `worker.ts`.)
  *
  * The SDK receives a store backed by this object's persistent storage, so mppx
- * channel state survives isolate eviction.
+ * channel state survives isolate eviction. Per-channel voucher records are
+ * persisted under `routedock:session:voucher:<channelId>`.
  *
  * Not yet durable: routedockHono still tracks lastCumulativeAmount,
  * voucherCount, lastSignatureHex and sessionPayerAddress in closure scope, and

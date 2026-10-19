@@ -32,6 +32,14 @@ export interface ManifestInput {
  * single JSON body per request is the correct shape. The tags were the only
  * inaccurate part and are dropped here; the path is unchanged so existing
  * clients and docs keep working.
+ *
+ * Note on channels: the manifest schema advertises a single
+ * `channel_factory` address, so that remains the provider's default/entry
+ * channel. The actual channel a session uses is named by the verified
+ * credential's challenge (`request.channel`) and may be a different deployed
+ * channel; the SDK keys all session state by that id. Changing the manifest to
+ * enumerate accepted channels would require a schema change, which is out of
+ * scope for this fix.
  */
 export function buildManifest({
   network,

@@ -34,10 +34,14 @@ export function withTypedChannelErrors(method: Method.AnyServer): Method.AnyServ
   } as Method.AnyServer
 }
 
-/** The shape `commit` needs from a channel credential — amount, signature, payer. */
+/** The shape `commit` needs from a channel credential — amount, signature, payer, channel. */
 export interface ChannelVerifyCredential {
   payload?: { amount?: unknown; signature?: unknown }
   source?: string
+  /** Some mppx versions expose the channel directly on the credential. */
+  channel?: unknown
+  /** The challenge echoes the request, which names the actual channel. */
+  challenge?: { request?: { channel?: unknown } }
 }
 
 /**

@@ -30,7 +30,7 @@ const payerKeypair = Keypair.random()
 const ASSET_CONTRACT = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
 const CHANNEL_CONTRACT = 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH'
 
-let closeCalls: Array<{ amount: bigint; signature: Uint8Array }> = []
+let closeCalls: Array<{ channel: string; amount: bigint; signature: Uint8Array }> = []
 
 mock.module('@stellar/mpp/channel/server', {
   namedExports: {
@@ -45,8 +45,8 @@ mock.module('@stellar/mpp/channel/server', {
         }
       },
     },
-    close: async (opts: { amount: bigint; signature: Uint8Array }) => {
-      closeCalls.push({ amount: opts.amount, signature: opts.signature })
+    close: async (opts: { channel: string; amount: bigint; signature: Uint8Array }) => {
+      closeCalls.push({ channel: opts.channel, amount: opts.amount, signature: opts.signature })
       return 'mock-close-tx-hash'
     },
     // mppChannel: the orphan/close paths never use mppx methods, so an empty
@@ -56,7 +56,12 @@ mock.module('@stellar/mpp/channel/server', {
 })
 
 const actualCompat = await import('../mppCompatibility.js')
-type Commit = (credential: { payload?: unknown; source?: string }) => void | Promise<void>
+type Commit = (credential: {
+  payload?: unknown
+  source?: string
+  channel?: string
+  challenge?: { request?: { channel?: string } }
+}) => void | Promise<void>
 let lastCommit: Commit | null = null
 mock.module('../mppCompatibility.js', {
   namedExports: {
@@ -104,7 +109,14 @@ function buildApp(handlers: {
   onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
   onOrphaned?: (channelId: string, info: { cumulativeAmount: string; lastSignature: string; voucherCount: number; reason: string }) => Promise<void>
+  onSettled?: (txHash: string, amount: string, mode: string, payer: string | null, channelId?: string) => Promise<void>
   idleTimeoutMs?: number
+  sessionStore?: {
+    get(k: string): Promise<unknown>
+    put(k: string, v: unknown): Promise<void>
+    delete(k: string): Promise<void>
+    update(k: string, fn: (v: unknown) => unknown): unknown
+  }
 }): { app: Hono; commit: Commit } {
   closeCalls = []
   const app = new Hono()
@@ -120,6 +132,7 @@ function buildApp(handlers: {
       manifest,
       modes: ['mpp-session'],
       pricing: { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } },
+      ...(handlers.sessionStore ? { sessionStore: handlers.sessionStore as never } : {}),
       ...handlers,
     }),
   )
@@ -268,5 +281,64 @@ describe('routedockHono — voucher state only from verified credentials', () =>
     assert.equal(closeCalls.length, 0)
     const json = await res.json() as { closeTxHash: unknown }
     assert.equal(json.closeTxHash, null)
+  })
+})
+
+describe('routedockHono — per-channel session state', () => {
+  it('keys two channels independently and closes the channel the DELETE names', async () => {
+    const store = new Map<string, unknown>()
+    const sessionStore = {
+      async get(k: string) { return store.get(k) },
+      async put(k: string, v: unknown) { store.set(k, v) },
+      async delete(k: string) { store.delete(k) },
+      update(k: string, fn: (v: unknown) => unknown) { store.set(k, fn(store.get(k))) },
+    }
+    const channelA = 'CCHANNELAAAA'
+    const channelB = 'CCHANNELBBBB'
+    const opens: string[] = []
+    const settled: Array<string | undefined> = []
+    const { app, commit } = buildApp({
+      sessionStore,
+      onSessionOpen: async (channelId) => { opens.push(channelId) },
+      onSettled: async (_tx, _amount, _mode, _payer, channelId) => { settled.push(channelId) },
+    })
+
+    await commit({
+      payload: { amount: '1000', signature: 'aa'.repeat(32) },
+      challenge: { request: { channel: channelA } },
+    })
+    await commit({
+      payload: { amount: '2000', signature: 'bb'.repeat(32) },
+      challenge: { request: { channel: channelB } },
+    })
+
+    assert.deepEqual(opens, [channelA, channelB])
+    assert.deepEqual(
+      [...store.keys()].sort(),
+      [`routedock:session:voucher:${channelA}`, `routedock:session:voucher:${channelB}`].sort(),
+    )
+
+    const closeA = await app.request('/price', {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ channelId: channelA, amount: '1000', signature: 'aa'.repeat(32) }),
+    })
+    assert.equal(closeA.status, 200)
+    assert.equal(closeCalls.length, 1)
+    assert.equal(closeCalls[0]?.channel, channelA)
+    assert.equal(closeCalls[0]?.amount, 1000n)
+    assert.equal(store.has(`routedock:session:voucher:${channelA}`), false)
+    assert.equal(store.has(`routedock:session:voucher:${channelB}`), true)
+
+    const closeB = await app.request('/price', {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ channelId: channelB, amount: '2000', signature: 'bb'.repeat(32) }),
+    })
+    assert.equal(closeB.status, 200)
+    assert.equal(closeCalls.length, 2)
+    assert.equal(closeCalls[1]?.channel, channelB)
+    assert.equal(closeCalls[1]?.amount, 2000n)
+    assert.deepEqual(settled, [channelA, channelB])
   })
 })

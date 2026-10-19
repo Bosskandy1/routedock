@@ -28,7 +28,13 @@ export interface SessionWriters {
     signature: string,
   ) => Promise<void>
   onOrphaned: (channelId: string, info: OrphanedSessionInfo) => Promise<void>
-  onSettled: (txHash: string, totalPaid: string, mode: string, payer: string | null) => Promise<void>
+  onSettled: (
+    txHash: string,
+    totalPaid: string,
+    mode: string,
+    payer: string | null,
+    channelId?: string,
+  ) => Promise<void>
 }
 
 /**
@@ -53,16 +59,23 @@ export function createSessionWriters(
   return {
     onSessionOpen: async (channelId, payer) => {
       if (!supabase) return
-      const { error } = await supabase.from('sessions').insert({
-        channel_id: channelId,
-        payee,
-        payer: payer ?? 'unknown',
-        cumulative_amount: '0',
-        status: 'open',
-        channel_contract: channelId,
-        network,
-        voucher_count: 0,
-      })
+      // A session can be opened more than once by retries (or by both the
+      // mpp-session and mpp-session-ws handlers). `channel_id` is UNIQUE, so
+      // ignore a duplicate instead of failing the request / resetting the
+      // cumulative amount already written by the first open.
+      const { error } = await supabase.from('sessions').upsert(
+        {
+          channel_id: channelId,
+          payee,
+          payer: payer ?? 'unknown',
+          cumulative_amount: '0',
+          status: 'open',
+          channel_contract: channelId,
+          network,
+          voucher_count: 0,
+        },
+        { onConflict: 'channel_id', ignoreDuplicates: true },
+      )
       if (error) console.error('[supabase] session insert failed:', error.message)
     },
 
@@ -109,16 +122,21 @@ export function createSessionWriters(
       if (amountError) console.error('[supabase] orphan amount update failed:', amountError.message)
     },
 
-    onSettled: async (txHash, totalPaid, mode, payer) => {
+    onSettled: async (txHash, totalPaid, mode, payer, channelId) => {
       console.log(`[settled] mode=${mode} txHash=${txHash} totalPaid=${totalPaid}`)
       if (!supabase) return
+
+      // Close the channel the settlement belongs to, not the configured
+      // default contract. `channelContract` remains the fallback for callers
+      // that predate per-channel settlement reporting.
+      const settledChannelId = channelId ?? channelContract
 
       // `.in` so a session already flagged `closing` is closed by a clean
       // settlement; rows already `closed` stay untouched.
       const { error: closeError } = await supabase
         .from('sessions')
         .update({ status: 'closed', settlement_tx_hash: txHash })
-        .eq('channel_id', channelContract)
+        .eq('channel_id', settledChannelId)
         .in('status', ['open', 'closing'])
       if (closeError) console.error('[supabase] session close failed:', closeError.message)
 

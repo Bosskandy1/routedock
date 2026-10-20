@@ -290,6 +290,12 @@ export const DEFAULT_MAX_SESSION_DURATION_MS = 3_600_000
 /** Options accepted by client.openSession() */
 export interface SessionOptions {
   /**
+   * Channel contract to use for this session. Defaults to the manifest's
+   * `channel_factory`. A provider must explicitly allowlist any other channel;
+   * the client rejects a challenge that does not name this channel.
+   */
+  channelId?: string
+  /**
    * Session payment mode. Defaults to 'mpp-session' (SSE-style one HTTP
    * request per voucher). Set to 'mpp-session-ws' to negotiate the channel
    * and first voucher over HTTP and then upgrade the connection to WebSocket

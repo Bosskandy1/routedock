@@ -174,6 +174,10 @@ export class MppSessionClient {
 
     const commitmentKey = Keypair.fromSecret(commitmentSecret)
     const channelFactory = pricing.channel_factory
+    if (options?.channelId !== undefined && options.channelId.trim().length === 0) {
+      throw new RouteDockManifestError('SessionOptions.channelId must be a non-empty channel contract address')
+    }
+    const channelId = options?.channelId?.trim() || channelFactory
     const agentPublicKey = this.keypair.publicKey()
     const agentKeypair = this.keypair
 
@@ -235,9 +239,9 @@ export class MppSessionClient {
       const request = challenge.request
 
       const channelValue = request['channel']
-      if (typeof channelValue !== 'string' || channelValue !== channelFactory) {
+      if (typeof channelValue !== 'string' || channelValue !== channelId) {
         throw new RouteDockChannelStateError(
-          `Challenge names channel ${String(channelValue)}, but the manifest channel_factory is ${channelFactory}`,
+          `Challenge names channel ${String(channelValue)}, but this session requested ${channelId}`,
         )
       }
 
@@ -403,7 +407,7 @@ export class MppSessionClient {
     const network = this.network
 
     const handle: SessionHandle = {
-      channelId: channelFactory,
+      channelId,
       // The channel is pre-deployed and funded before the agent runs, so the
       // client never issues the channel-open transaction and has no hash for
       // it. Report null rather than the contract address (a non-transaction
@@ -422,7 +426,7 @@ export class MppSessionClient {
           // Same conversion as SessionCloseResult.totalPaid so a per-session
           // sub-cap can be compared against stats().currentCumulative directly.
           currentCumulative: (Number(currentCumulative) / 1e7).toFixed(7),
-          channelId: channelFactory,
+          channelId,
           openTxHash: null,
         }
       },
@@ -580,7 +584,7 @@ export class MppSessionClient {
           ? 'https://soroban-testnet.stellar.org'
           : 'https://soroban.stellar.org'
         const server = new rpcMod.Server(rpcUrl)
-        const contract = new Contract(channelFactory)
+        const contract = new Contract(channelId)
         const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
 
         const account = await withRetry(async () => {
@@ -642,6 +646,7 @@ export class MppSessionClient {
               body: JSON.stringify({
                 amount: currentCumulative.toString(),
                 signature: Buffer.from(signature).toString('hex'),
+                channelId,
               }),
             })
           } catch (err) {
@@ -697,7 +702,7 @@ export class MppSessionClient {
           ? 'https://soroban-testnet.stellar.org'
           : 'https://soroban.stellar.org'
         const server = new rpcMod.Server(rpcUrl)
-        const contract = new Contract(channelFactory)
+        const contract = new Contract(channelId)
         const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
 
         try {
@@ -737,7 +742,7 @@ export class MppSessionClient {
           ? 'https://soroban-testnet.stellar.org'
           : 'https://soroban.stellar.org'
         const server = new rpcMod.Server(rpcUrl)
-        const contract = new Contract(channelFactory)
+        const contract = new Contract(channelId)
         const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
 
         try {
@@ -791,7 +796,7 @@ export class MppSessionClient {
           ? 'https://soroban-testnet.stellar.org'
           : 'https://soroban.stellar.org'
         const server = new rpcMod.Server(rpcUrl)
-        const contract = new Contract(channelFactory)
+        const contract = new Contract(channelId)
         const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
 
         try {

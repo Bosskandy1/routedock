@@ -47,14 +47,17 @@ const CAIP2: Record<Network, X402Network> = {
 
 const OZ_FACILITATOR_URL = 'https://channels.openzeppelin.com/x402'
 
+type SessionChannel = { channel: string; commitmentKey: string }
+type SessionPricing = { rate: string; channelFactory: string; channels?: SessionChannel[] }
+
 export interface RouteDockHonoOptions {
   modes: PaymentMode[]
   pricing: {
     x402?: string
     'mpp-charge'?: string
-    'mpp-session'?: { rate: string; channelFactory: string }
+    'mpp-session'?: SessionPricing
     /** WebSocket transport variant of mpp-session — same channel, WS streaming */
-    'mpp-session-ws'?: { rate: string; channelFactory: string }
+    'mpp-session-ws'?: SessionPricing
   }
   asset?: string
   assetContract?: string
@@ -500,17 +503,31 @@ interface VerifiedVoucherRecord {
 
 function createMppSessionHandlerState(
   opts: RouteDockHonoOptions,
-  sessionPricing: { rate: string; channelFactory: string },
+  sessionPricing: SessionPricing,
   reportMode: 'mpp-session' | 'mpp-session-ws',
 ): MppSessionHandlerState {
   const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
   const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
   const logger = resolveLogger(opts.logger)
   // `channelFactory` is the provider's default (and advertised) channel. A
-  // verified credential may name a different on-chain channel — one agent per
-  // channel — so all session state below is keyed by the channel the credential
-  // actually named, never by this static default.
+  // verified credential may name another explicitly allowlisted channel, so
+  // session state is keyed by the verifier that accepted it.
   const defaultChannelId = sessionPricing.channelFactory
+
+  const commitmentKeys = new Map<string, string>([[defaultChannelId, opts.commitmentPublicKey!]])
+  for (const entry of sessionPricing.channels ?? []) {
+    if (!entry.channel.trim() || !entry.commitmentKey.trim()) {
+      throw new Error('routedockHono: session channels require a channel and commitmentKey')
+    }
+    const existingKey = commitmentKeys.get(entry.channel)
+    if (existingKey !== undefined) {
+      if (existingKey !== entry.commitmentKey) {
+        throw new Error(`routedockHono: duplicate session channel ${entry.channel} has conflicting commitment keys`)
+      }
+      continue
+    }
+    commitmentKeys.set(entry.channel, entry.commitmentKey)
+  }
 
   const innerStore = opts.sessionStore ?? Store.memory()
 
@@ -644,8 +661,7 @@ function createMppSessionHandlerState(
   // credential named, then runs the bookkeeping (voucher count, idle timer,
   // onSessionOpen/onVoucher) that used to run inside the store's `put`, before
   // the caller knew verification had actually succeeded.
-  async function commit(credential: ChannelVerifyCredential): Promise<void> {
-    const channelId = channelIdFromCredential(credential, defaultChannelId)
+  async function commit(credential: ChannelVerifyCredential, channelId: string): Promise<void> {
     const state = stateFor(channelId)
     await loadPersistedRecord(state, channelId)
     const payload = credential.payload
@@ -694,10 +710,9 @@ function createMppSessionHandlerState(
   }
 
   // Mppx verifies against a specific channel contract, so keep one instance per
-  // channel. The default is created eagerly (unchanged construction behavior);
-  // a credential that names another channel gets a lazily-created instance for
-  // that channel on first use.
-  function createMppx(channelId: string): unknown {
+  // channel. Construct only allowlisted channels, each with its own verifier
+  // key, so an untrusted credential can never select an arbitrary contract.
+  function createMppx(channelId: string, commitmentKey: string): unknown {
     return Mppx.create({
       secretKey: opts.payeeSecretKey,
       methods: [
@@ -705,13 +720,13 @@ function createMppSessionHandlerState(
           onVerifiedCredential(
             mppChannel({
               channel: channelId,
-              commitmentKey: opts.commitmentPublicKey!,
+              commitmentKey,
               network: networkId,
               store: wrappedStore,
               sourceAccount: payeeKeypair.publicKey(),
               feePayer: channelAuthorizer(payeeKeypair),
             }) as Method.AnyServer,
-            commit,
+            (credential) => commit(credential, channelId),
           ),
         ),
       ],
@@ -719,21 +734,20 @@ function createMppSessionHandlerState(
   }
 
   const mppxByChannel = new Map<string, unknown>()
-  const mppx = createMppx(defaultChannelId)
-  mppxByChannel.set(defaultChannelId, mppx)
+  for (const [channelId, commitmentKey] of commitmentKeys) {
+    mppxByChannel.set(channelId, createMppx(channelId, commitmentKey))
+  }
+  const mppx = mppxByChannel.get(defaultChannelId)!
 
   function mppxFor(channelId: string): unknown {
-    const existing = mppxByChannel.get(channelId)
-    if (existing) return existing
-    const created = createMppx(channelId)
-    mppxByChannel.set(channelId, created)
-    return created
+    return mppxByChannel.get(channelId) ?? mppx
   }
 
   function channelIdForRequest(request: globalThis.Request): string {
     try {
       const credential = Credential.fromRequest(request) as ChannelVerifyCredential
-      return channelIdFromCredential(credential, defaultChannelId)
+      const requestedChannel = channelIdFromCredential(credential, defaultChannelId)
+      return commitmentKeys.has(requestedChannel) ? requestedChannel : defaultChannelId
     } catch {
       // No usable credential yet — issue the default channel's challenge.
       return defaultChannelId
@@ -748,7 +762,9 @@ function createMppSessionHandlerState(
     channel_id?: unknown
   } | undefined): string {
     for (const named of [body?.channelId, body?.channel_id, body?.channel]) {
-      if (typeof named === 'string' && named.length > 0) return named
+      if (typeof named === 'string' && (commitmentKeys.has(named) || knownChannelIds.has(named))) {
+        return named
+      }
     }
     // Backwards compatibility: a close that names no channel (the pre-fix
     // protocol) targets the only channel this handler knows about.
@@ -757,7 +773,7 @@ function createMppSessionHandlerState(
     // unique match is safe; anything ambiguous falls back to the default.
     if (body?.signature) {
       const matches = [...knownChannelIds].filter(
-        (id) => stateFor(id).record?.signature === body.signature,
+        (id) => channelStates.get(id)?.record?.signature === body.signature,
       )
       if (matches.length === 1) return matches[0]!
     }
@@ -767,7 +783,7 @@ function createMppSessionHandlerState(
       })()
       if (amount !== null) {
         const matches = [...knownChannelIds].filter(
-          (id) => stateFor(id).record?.amount === amount,
+          (id) => channelStates.get(id)?.record?.amount === amount,
         )
         if (matches.length === 1) return matches[0]!
       }
@@ -1000,7 +1016,16 @@ export function routedockHono(opts: RouteDockHonoOptions): MiddlewareHandler {
     if (!opts.commitmentPublicKey) {
       throw new Error('routedockHono: mpp-session/mpp-session-ws mode requires commitmentPublicKey')
     }
-    const sessionPricing = opts.pricing[primarySessionMode]!
+    const primaryPricing = opts.pricing[primarySessionMode]!
+    for (const mode of sessionModes) {
+      if (opts.pricing[mode]!.channelFactory !== primaryPricing.channelFactory) {
+        throw new Error('routedockHono: mpp-session and mpp-session-ws must share a default channel')
+      }
+    }
+    const sessionPricing: SessionPricing = {
+      ...primaryPricing,
+      channels: sessionModes.flatMap((mode) => opts.pricing[mode]!.channels ?? []),
+    }
     const sharedState = createMppSessionHandlerState(opts, sessionPricing, primarySessionMode)
     for (const mode of sessionModes) {
       handlers.push(

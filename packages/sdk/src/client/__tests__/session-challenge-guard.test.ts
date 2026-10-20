@@ -196,6 +196,27 @@ describe('MppSessionClient — onChallenge wiring', () => {
 })
 
 describe('MppSessionClient — challenge guard (mpp-session)', () => {
+  it('accepts an explicitly requested channel when the provider challenges that channel', async () => {
+    reset([{ amount: '1000', channel: OTHER_CONTRACT, cumulativeAmount: '0' }])
+    const handle = await openHandle({ channelId: OTHER_CONTRACT })
+
+    const err = await nextError(handle)
+
+    assert.equal(err, undefined)
+    assert.equal(handle.channelId, OTHER_CONTRACT)
+    assert.equal(credentialContexts.length, 1)
+  })
+
+  it('rejects a provider fallback challenge for a different requested channel', async () => {
+    reset([{ amount: '1000', cumulativeAmount: '0' }])
+    const handle = await openHandle({ channelId: OTHER_CONTRACT })
+
+    const err = await nextError(handle)
+
+    assert.ok(isChannelStateError(/requested/)(err))
+    assert.equal(credentialContexts.length, 0)
+  })
+
   it('rejects a challenge whose cumulative amount is just under the deposit', async () => {
     // #given the provider's own numbers: rate 1000 stroops, deposit 1,000,000
     reset([{ amount: '1000', cumulativeAmount: '999000' }])

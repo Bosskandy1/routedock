@@ -36,11 +36,14 @@ const payerKeypair = Keypair.random()
 
 const ASSET_CONTRACT = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
 const CHANNEL_CONTRACT = 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH'
+const SECOND_CHANNEL = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'
 
 /** Sentinel signature the fake channel-verify method treats as invalid. */
 const BAD_SIGNATURE = 'bad-signature-sentinel'
 
-let closeCalls: Array<{ amount: bigint; signature: Uint8Array }> = []
+let closeCalls: Array<{ channel: string; amount: bigint; signature: Uint8Array }> = []
+let verifierConfigs: Array<{ channel: string; commitmentKey: string }> = []
+let issuedChallengeChannels: string[] = []
 
 mock.module('@stellar/mpp/channel/server', {
   namedExports: {
@@ -55,8 +58,8 @@ mock.module('@stellar/mpp/channel/server', {
         }
       },
     },
-    close: async (opts: { amount: bigint; signature: Uint8Array }) => {
-      closeCalls.push({ amount: opts.amount, signature: opts.signature })
+    close: async (opts: { channel: string; amount: bigint; signature: Uint8Array }) => {
+      closeCalls.push({ channel: opts.channel, amount: opts.amount, signature: opts.signature })
       return 'mock-close-tx-hash'
     },
     // A stand-in for the real Soroban channel verification: rejects the
@@ -68,15 +71,23 @@ mock.module('@stellar/mpp/channel/server', {
     // on that exact key, so a fake verify that skips this write would make a
     // regression test pass on main for the wrong reason (bookkeeping never
     // ran at all) rather than the real one (a crafted header wins the race).
-    stellar: (opts: { channel: string; store: { put(key: string, value: unknown): Promise<void> } }): Method.AnyServer =>
-      ({
+    stellar: (opts: { channel: string; commitmentKey: string; store: { put(key: string, value: unknown): Promise<void> } }): Method.AnyServer => {
+      verifierConfigs.push({ channel: opts.channel, commitmentKey: opts.commitmentKey })
+      return ({
         name: 'stellar',
         intent: 'channel',
+        channelId: opts.channel,
         verify: async ({
           credential,
         }: {
-          credential: { payload?: { signature?: unknown; amount?: unknown } }
+          credential: {
+            payload?: { signature?: unknown; amount?: unknown }
+            challenge?: { request?: { channel?: unknown } }
+          }
         }) => {
+          if (credential?.challenge?.request?.channel !== opts.channel) {
+            throw new Error('Credential channel is not served by this verifier')
+          }
           if (credential?.payload?.signature === BAD_SIGNATURE) {
             throw new Error('Commitment signature verification failed.')
           }
@@ -85,7 +96,8 @@ mock.module('@stellar/mpp/channel/server', {
           })
           return { status: 'success' }
         },
-      }) as unknown as Method.AnyServer,
+      }) as unknown as Method.AnyServer
+    },
   },
 })
 
@@ -101,12 +113,13 @@ mock.module('mppx/server', {
             (_opts: { amount: string; description?: string }) =>
             async (request: globalThis.Request) => {
               const auth = request.headers.get('authorization')
-              if (!auth) return { status: 402, challenge: buildChallengeResponse() }
+              const channelId = (channelMethod as Method.AnyServer & { channelId?: string }).channelId ?? CHANNEL_CONTRACT
+              if (!auth) return { status: 402, challenge: buildChallengeResponse(channelId) }
               let credential
               try {
                 credential = Credential.deserialize(auth)
               } catch {
-                return { status: 402, challenge: buildChallengeResponse() }
+                return { status: 402, challenge: buildChallengeResponse(channelId) }
               }
               try {
                 await channelMethod.verify({ credential, request: {} } as Parameters<
@@ -114,7 +127,7 @@ mock.module('mppx/server', {
                 >[0])
                 return { status: 200 }
               } catch {
-                return { status: 402, challenge: buildChallengeResponse() }
+                return { status: 402, challenge: buildChallengeResponse(channelId) }
               }
             },
         }
@@ -123,13 +136,14 @@ mock.module('mppx/server', {
   },
 })
 
-function buildChallengeResponse(): Response {
+function buildChallengeResponse(channelId = CHANNEL_CONTRACT): Response {
+  issuedChallengeChannels.push(channelId)
   const challenge = Challenge.from({
     id: 'test-challenge-id',
     realm: 'test-realm',
     method: 'stellar',
     intent: 'channel',
-    request: {},
+    request: { channel: channelId },
   })
   return new Response('Payment Required', {
     status: 402,
@@ -138,13 +152,13 @@ function buildChallengeResponse(): Response {
 }
 
 /** Builds a genuine `Payment ...` Authorization header via the real mppx Credential codec. */
-function buildVoucherHeader(payload: { amount: string; signature: string }, source?: string): string {
+function buildVoucherHeader(payload: { amount: string; signature: string }, source?: string, channelId = CHANNEL_CONTRACT): string {
   const challenge = Challenge.from({
     id: 'test-challenge-id',
     realm: 'test-realm',
     method: 'stellar',
     intent: 'channel',
-    request: {},
+    request: { channel: channelId },
   })
   const credential = Credential.from({
     challenge,
@@ -216,10 +230,13 @@ function buildApp(handlers: {
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
   onOrphaned?: (channelId: string, info: { cumulativeAmount: string; lastSignature: string; voucherCount: number; reason: string }) => Promise<void>
   idleTimeoutMs?: number
+  channels?: Array<{ channel: string; commitmentKey: string }>
   sessionStore?: ReturnType<typeof createSharedMemoryStore>
 }): Hono {
   closeCalls = []
-  const { sessionStore, ...rest } = handlers
+  const { sessionStore, channels, ...rest } = handlers
+  verifierConfigs = []
+  issuedChallengeChannels = []
   const app = new Hono()
   app.use(
     '*',
@@ -232,7 +249,7 @@ function buildApp(handlers: {
       commitmentPublicKey: commitKeypair.publicKey(),
       manifest,
       modes: ['mpp-session'],
-      pricing: { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } },
+      pricing: { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT, ...(channels ? { channels } : {}) } },
       ...(sessionStore ? { sessionStore: sessionStore as never } : {}),
       ...rest,
     }),
@@ -242,6 +259,59 @@ function buildApp(handlers: {
 }
 
 describe('routedockHono — real HTTP regression coverage for verified-only voucher state (#388)', () => {
+  it('verifies allowlisted channels with their own keys and falls back for an unlisted credential', async () => {
+    const secondCommitment = Keypair.random()
+    const opens: string[] = []
+    const app = buildApp({
+      channels: [{ channel: SECOND_CHANNEL, commitmentKey: secondCommitment.publicKey() }],
+      onSessionOpen: async (channelId) => { opens.push(channelId) },
+    })
+
+    assert.deepEqual(verifierConfigs, [
+      { channel: CHANNEL_CONTRACT, commitmentKey: commitKeypair.publicKey() },
+      { channel: SECOND_CHANNEL, commitmentKey: secondCommitment.publicKey() },
+    ])
+
+    for (const [index, channelId] of [CHANNEL_CONTRACT, SECOND_CHANNEL].entries()) {
+      const response = await app.request('/price', {
+        headers: {
+          authorization: buildVoucherHeader(
+            { amount: String((index + 1) * 1000), signature: String(index + 1).repeat(128) },
+            undefined,
+            channelId,
+          ),
+        },
+      })
+      assert.equal(response.status, 200)
+    }
+    assert.deepEqual(opens, [CHANNEL_CONTRACT, SECOND_CHANNEL])
+
+    const unlisted = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC'
+    const rejected = await app.request('/price', {
+      headers: {
+        authorization: buildVoucherHeader({ amount: '3000', signature: '33'.repeat(64) }, undefined, unlisted),
+      },
+    })
+    assert.equal(rejected.status, 402)
+    assert.equal(issuedChallengeChannels.at(-1), CHANNEL_CONTRACT, 'unknown channels receive the default challenge')
+    assert.equal(verifierConfigs.length, 2, 'untrusted channel IDs must not create verifier instances')
+    assert.deepEqual(opens, [CHANNEL_CONTRACT, SECOND_CHANNEL], 'unverified channels must not create session state')
+
+    for (const [index, channelId] of [CHANNEL_CONTRACT, SECOND_CHANNEL].entries()) {
+      const closed = await app.request('/price', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channelId,
+          amount: String((index + 1) * 1000),
+          signature: String(index + 1).repeat(128),
+        }),
+      })
+      assert.equal(closed.status, 200)
+    }
+    assert.deepEqual(closeCalls.map((call) => call.channel), [CHANNEL_CONTRACT, SECOND_CHANNEL])
+  })
+
   it('closes with the last genuinely verified voucher signature, not a signature from a crafted header in the old, pre-fix format', async () => {
     const voucherCalls: Array<{ amount: string; signature: string }> = []
     const sessionOpens: Array<string | null> = []

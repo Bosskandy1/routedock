@@ -66,6 +66,22 @@ const client = new RouteDockClient({
 
 ## Provider Usage
 
+For multiple pre-deployed session channels, configure each accepted channel and
+its own commitment public key under session pricing. The manifest's
+`channel_factory` remains the default; unknown channel requests receive its
+challenge. A client can select an accepted channel with `SessionOptions.channelId`
+and must use the corresponding commitment secret.
+
+```ts
+pricing: {
+  'mpp-session': {
+    rate: '0.0001',
+    channelFactory: defaultChannel,
+    channels: [{ channel: secondaryChannel, commitmentKey: secondaryCommitmentPublicKey }],
+  },
+}
+```
+
 ```ts
 import express from 'express'
 import { routedock } from '@routedock/sdk/provider'

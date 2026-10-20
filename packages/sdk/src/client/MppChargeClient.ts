@@ -7,6 +7,7 @@ import {
   RouteDockManifestError,
   RouteDockPolicyRejectError,
   httpStatusToError,
+  paymentRejectedError,
   wrapMppError,
 } from '../errors.js'
 import { stroopsToUsdc } from '../internal/usdc.js'
@@ -77,7 +78,7 @@ export class MppChargeClient {
             response,
           )
         }
-        throw new RouteDockManifestError(`MPP charge failed: HTTP ${response.status}`)
+        throw await paymentRejectedError('MPP charge failed', response.status, response)
       }
 
       const txHash = readSettlementHash(response)

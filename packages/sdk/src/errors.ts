@@ -113,6 +113,16 @@ export class RouteDockTrustlineError extends RouteDockError {
   }
 }
 
+/** The payer account does not exist on the selected Stellar network. */
+export class RouteDockAccountNotFoundError extends RouteDockError {
+  readonly network: string
+  constructor(network: string, options: RouteDockErrorOptions = {}) {
+    super(`Payer account is not funded on Stellar ${network}. Fund the account on this network before paying.`, 'ACCOUNT_NOT_FOUND', false, options)
+    this.name = 'RouteDockAccountNotFoundError'
+    this.network = network
+  }
+}
+
 /** x402 facilitator or provider returned a retryable HTTP failure (5xx, 429). */
 export class RouteDockFacilitatorError extends RouteDockError {
   readonly status: number

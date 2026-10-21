@@ -5,7 +5,7 @@ import { MppChargeClient } from './MppChargeClient.js'
 import { MppSessionClient } from './MppSessionClient.js'
 import { prepareNulthSigner, NulthPolicyError, type NulthVaultConfig } from './NulthVault.js'
 import type { PaymentResult, SessionHandle, SessionOptions, RouteDockManifest, PaymentMode, EstimateCostResult, PreflightResult } from '../types.js'
-import { RouteDockManifestError, RouteDockPolicyRejectError, RouteDockTrustlineError } from '../errors.js'
+import { RouteDockManifestError, RouteDockPolicyRejectError, RouteDockTrustlineError, RouteDockAccountNotFoundError } from '../errors.js'
 import type { RetryPolicy } from '../internal/retry.js'
 import { USDC_ISSUERS, usdcToStroops } from '../internal/usdc.js'
 import { InMemorySpendStore, type DailySpend, type SpendStore } from '../store/SpendStore.js'
@@ -347,9 +347,14 @@ export class RouteDockClient {
       })
     } catch (err) {
       if (err instanceof RouteDockTrustlineError) throw err
+      const status = (err as { response?: { status?: number } })?.response?.status
+      if (status === 404 || (err instanceof Error && /not found|account/i.test(err.message))) {
+        throw new RouteDockAccountNotFoundError(this.network)
+      }
       this.logger?.(
         'warn',
         `[RouteDock] Trustline preflight: could not verify trustline for ${targetAsset} — continuing`,
+        { error: err instanceof Error ? err.message : String(err) },
       )
     }
   }

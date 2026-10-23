@@ -404,8 +404,8 @@ export class RouteDockClient {
     } catch (err) {
       if (err instanceof RouteDockTrustlineError) throw err
       const status = (err as { response?: { status?: number } })?.response?.status
-      if (status === 404 || (err instanceof Error && /not found|account/i.test(err.message))) {
-        throw new RouteDockAccountNotFoundError(this.network)
+      if (status === 404) {
+        throw new RouteDockAccountNotFoundError(this.network, { cause: err })
       }
       this.logger?.(
         'warn',

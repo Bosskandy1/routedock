@@ -748,8 +748,11 @@ function createMppSessionHandlerState(
       const requestedChannel = channelIdFromCredential(credential, defaultChannelId)
       return commitmentKeys.has(requestedChannel) ? requestedChannel : defaultChannelId
     } catch {
-      // No usable credential yet — issue the default channel's challenge.
-      return defaultChannelId
+      // No usable credential yet. A client names the channel it wants in this
+      // header so it gets that channel's challenge; only allowlisted channels
+      // are honored, anything else gets the default challenge.
+      const hinted = request.headers.get('X-RouteDock-Channel')
+      return hinted !== null && commitmentKeys.has(hinted) ? hinted : defaultChannelId
     }
   }
 

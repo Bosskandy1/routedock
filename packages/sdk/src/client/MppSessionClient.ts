@@ -516,7 +516,10 @@ export class MppSessionClient {
           withRetry(async () => {
             let resp: Response
             try {
-              resp = await mppx.fetch(url, { signal: abortController.signal })
+              // Name the channel up front so the provider can issue this
+              // channel's challenge; the default channel is used when omitted.
+              const headers = options?.channelId !== undefined ? { 'X-RouteDock-Channel': channelId } : undefined
+              resp = await mppx.fetch(url, { signal: abortController.signal, headers })
             } catch (err) {
               if (abortController.signal.aborted) {
                 throw err

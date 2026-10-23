@@ -15,6 +15,7 @@ export type RouteDockErrorCode =
   | 'REFUND_WINDOW'
   | 'CLIENT_VERSION_TOO_OLD'
   | 'TRUSTLINE'
+  | 'ACCOUNT_NOT_FOUND'
 
 export interface RouteDockErrorOptions {
   cause?: unknown

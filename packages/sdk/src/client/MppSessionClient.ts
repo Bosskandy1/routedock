@@ -280,8 +280,12 @@ export class MppSessionClient {
 
       const channelValue = request['channel']
       if (typeof channelValue !== 'string' || channelValue !== channelId) {
+        const expected =
+          options?.channelId !== undefined
+            ? `this session requested ${channelId}`
+            : `the manifest channel_factory is ${channelFactory}`
         throw new RouteDockChannelStateError(
-          `Challenge names channel ${String(channelValue)}, but this session requested ${channelId}`,
+          `Challenge names channel ${String(channelValue)}, but ${expected}`,
         )
       }
 

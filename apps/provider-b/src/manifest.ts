@@ -34,12 +34,11 @@ export interface ManifestInput {
  * clients and docs keep working.
  *
  * Note on channels: the manifest schema advertises a single
- * `channel_factory` address, so that remains the provider's default/entry
- * channel. The actual channel a session uses is named by the verified
- * credential's challenge (`request.channel`) and may be a different deployed
- * channel; the SDK keys all session state by that id. Changing the manifest to
- * enumerate accepted channels would require a schema change, which is out of
- * scope for this fix.
+ * `channel_factory` address, which is this provider's default channel. This
+ * deployment sets no `channels` allowlist, so it accepts only that default
+ * channel and rejects sessions on any other. The SDK keys session state by
+ * channel, so an allowlisted second channel could be added through the session
+ * pricing config; the manifest schema does not list accepted channels yet.
  */
 export function buildManifest({
   network,

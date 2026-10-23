@@ -6,10 +6,11 @@ export { ChannelSession } from './ChannelSession.js'
 /**
  * Edge entry point. Everything that touches session state is forwarded to a
  * single Durable Object, named after the configured default channel. That
- * object holds a map of per-channel state keyed by the actual channel each
- * verified credential names (see `createMppSessionHandlerState`), so two agents
- * paying through two deployed channels do not share a voucher record or a
- * `sessions` row.
+ * object holds a map of per-channel state keyed by the channel each verified
+ * credential names (see `createMppSessionHandlerState`). This deployment only
+ * allowlists its default channel, so today it serves that one channel; the
+ * keying is there so an allowlisted second channel would not share a voucher
+ * record or a `sessions` row.
  *
  * We deliberately keep one object rather than `idFromName(actualChannelId)`:
  * the worker forwards the request before payment verification, and a DELETE
@@ -78,7 +79,8 @@ export default {
 
     console.log(
       `[reconcile] orphaned=${stats.orphanedCount} recovered=${stats.recoveredCount} ` +
-        `skipped=${stats.skippedCount} failed=${stats.failedCount}`,
+        `skipped=${stats.skippedCount} failed=${stats.failedCount} ` +
+        `already_closed=${stats.alreadyClosedCount} terminal=${stats.terminalCount}`,
     )
     for (const { channelId, reason } of stats.errors) {
       console.error(`[reconcile] close failed for ${channelId}: ${reason}`)

@@ -62,14 +62,16 @@ type Commit = (credential: {
   channel?: string
   challenge?: { request?: { channel?: string } }
 }) => void | Promise<void>
-let lastCommit: Commit | null = null
+// One entry per verifier, in the order the provider creates them: the default
+// channel first, then each allowlisted channel.
+let verifierCommits: Commit[] = []
 mock.module('../mppCompatibility.js', {
   namedExports: {
     channelAuthorizer: actualCompat.channelAuthorizer,
     withTypedChannelErrors: actualCompat.withTypedChannelErrors,
     formatMppError: actualCompat.formatMppError,
     onVerifiedCredential: (method: unknown, commit: Commit) => {
-      lastCommit = commit
+      verifierCommits.push(commit)
       return method
     },
   },
@@ -106,6 +108,7 @@ const manifest: RouteDockManifest = {
  * before any other test's app-building can reassign it).
  */
 function buildApp(handlers: {
+  channels?: Array<{ channel: string; commitmentKey: string }>
   onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
   onOrphaned?: (channelId: string, info: { cumulativeAmount: string; lastSignature: string; voucherCount: number; reason: string }) => Promise<void>
@@ -117,8 +120,10 @@ function buildApp(handlers: {
     delete(k: string): Promise<void>
     update(k: string, fn: (v: unknown) => unknown): unknown
   }
-}): { app: Hono; commit: Commit } {
+}): { app: Hono; commit: Commit; commitFor: (channelId: string) => Commit } {
   closeCalls = []
+  verifierCommits = []
+  const { channels = [], ...hookOptions } = handlers
   const app = new Hono()
   app.use(
     '*',
@@ -131,14 +136,30 @@ function buildApp(handlers: {
       commitmentPublicKey: commitKeypair.publicKey(),
       manifest,
       modes: ['mpp-session'],
-      pricing: { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } },
-      ...(handlers.sessionStore ? { sessionStore: handlers.sessionStore as never } : {}),
-      ...handlers,
+      pricing: {
+        'mpp-session': {
+          rate: '0.0001',
+          channelFactory: CHANNEL_CONTRACT,
+          ...(channels.length > 0 ? { channels } : {}),
+        },
+      },
+      ...hookOptions,
     }),
   )
-  assert.ok(lastCommit, 'onVerifiedCredential mock should have captured commit during construction')
-  const commit = lastCommit!
-  return { app, commit }
+  const channelOrder = [CHANNEL_CONTRACT, ...channels.map((entry) => entry.channel)]
+  assert.equal(
+    verifierCommits.length,
+    channelOrder.length,
+    'expected one onVerifiedCredential commit per verifier during construction',
+  )
+  const commitByChannel = new Map(channelOrder.map((channel, i) => [channel, verifierCommits[i]!]))
+  const commit = commitByChannel.get(CHANNEL_CONTRACT)!
+  const commitFor = (channelId: string): Commit => {
+    const found = commitByChannel.get(channelId)
+    assert.ok(found, `no verifier was created for channel ${channelId}`)
+    return found
+  }
+  return { app, commit, commitFor }
 }
 
 function hexToBytesLocal(hex: string): Uint8Array {
@@ -297,17 +318,22 @@ describe('routedockHono — per-channel session state', () => {
     const channelB = 'CCHANNELBBBB'
     const opens: string[] = []
     const settled: Array<string | undefined> = []
-    const { app, commit } = buildApp({
+    const { app, commitFor } = buildApp({
       sessionStore,
+      channels: [
+        { channel: channelA, commitmentKey: Keypair.random().publicKey() },
+        { channel: channelB, commitmentKey: Keypair.random().publicKey() },
+      ],
       onSessionOpen: async (channelId) => { opens.push(channelId) },
       onSettled: async (_tx, _amount, _mode, _payer, channelId) => { settled.push(channelId) },
     })
 
-    await commit({
+    // Each channel's voucher is verified and committed by its own verifier.
+    await commitFor(channelA)({
       payload: { amount: '1000', signature: 'aa'.repeat(32) },
       challenge: { request: { channel: channelA } },
     })
-    await commit({
+    await commitFor(channelB)({
       payload: { amount: '2000', signature: 'bb'.repeat(32) },
       challenge: { request: { channel: channelB } },
     })

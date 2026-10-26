@@ -218,6 +218,7 @@ export class MppSessionClient {
       throw new RouteDockManifestError('SessionOptions.channelId must be a non-empty channel contract address')
     }
     const channelId = options?.channelId?.trim() || channelFactory
+    const channelWasRequested = options?.channelId !== undefined
     const agentPublicKey = this.keypair.publicKey()
     const agentKeypair = this.keypair
 
@@ -522,8 +523,11 @@ export class MppSessionClient {
             try {
               // Name the channel up front so the provider can issue this
               // channel's challenge; the default channel is used when omitted.
-              const headers = options?.channelId !== undefined ? { 'X-RouteDock-Channel': channelId } : undefined
-              resp = await mppx.fetch(url, { signal: abortController.signal, headers })
+              const requestInit: RequestInit = { signal: abortController.signal }
+              if (channelWasRequested) {
+                requestInit.headers = { 'X-RouteDock-Channel': channelId }
+              }
+              resp = await mppx.fetch(url, requestInit)
             } catch (err) {
               if (abortController.signal.aborted) {
                 throw err

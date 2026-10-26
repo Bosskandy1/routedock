@@ -149,6 +149,7 @@ function buildApp(handlers: {
   }
   if (handlers.onSessionOpen) opts.onSessionOpen = handlers.onSessionOpen
   if (handlers.onVoucher) opts.onVoucher = handlers.onVoucher
+  if (handlers.onSettled) opts.onSettled = handlers.onSettled
   if (handlers.onOrphaned) opts.onOrphaned = handlers.onOrphaned
   if (typeof handlers.idleTimeoutMs === 'number') opts.idleTimeoutMs = handlers.idleTimeoutMs
   if (handlers.sessionStore) opts.sessionStore = handlers.sessionStore
@@ -472,6 +473,8 @@ describe('routedockHono — per-channel session state', () => {
     const channelB = 'CCHANNELBBBB'
     const opens: string[] = []
     const settled: Array<string | undefined> = []
+    let resolveSettled: (() => void) | undefined
+    const settledPromise = new Promise<void>((resolve) => { resolveSettled = resolve })
     const { app, commitFor } = buildApp({
       sessionStore,
       channels: [
@@ -479,7 +482,10 @@ describe('routedockHono — per-channel session state', () => {
         { channel: channelB, commitmentKey: Keypair.random().publicKey() },
       ],
       onSessionOpen: async (channelId) => { opens.push(channelId) },
-      onSettled: async (_tx, _amount, _mode, _payer, channelId) => { settled.push(channelId) },
+      onSettled: async (_tx, _amount, _mode, _payer, channelId) => {
+        settled.push(channelId)
+        if (settled.length === 2) resolveSettled?.()
+      },
     })
 
     // Each channel's voucher is verified and committed by its own verifier.
@@ -519,6 +525,10 @@ describe('routedockHono — per-channel session state', () => {
     assert.equal(closeCalls.length, 2)
     assert.equal(closeCalls[1]?.channel, channelB)
     assert.equal(closeCalls[1]?.amount, 2000n)
+    await Promise.race([
+      settledPromise,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('onSettled did not report both channels')), 1000)),
+    ])
     assert.deepEqual(settled, [channelA, channelB])
   })
 })

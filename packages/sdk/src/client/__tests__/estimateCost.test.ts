@@ -14,7 +14,8 @@
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import assert from 'node:assert/strict'
-import { Keypair } from '@stellar/stellar-sdk'
+import { mock } from 'node:test'
+import { Horizon, Keypair } from '@stellar/stellar-sdk'
 import { RouteDockClient } from '../RouteDockClient.js'
 import { RouteDockManifestError } from '../../errors.js'
 import type { PaymentResult } from '../../types.js'
@@ -243,6 +244,17 @@ const SESSION_MANIFEST = signManifest({
   })
 
   try {
+    mock.method(Horizon.Server.prototype, 'loadAccount', async () => ({
+      balances: [
+        { asset_type: 'native', balance: '10.0000000' },
+        {
+          asset_type: 'credit_alphanum4',
+          asset_code: 'USDC',
+          asset_issuer: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+          balance: '5.0000000',
+        },
+      ],
+    }))
     const client = new RouteDockClient({ wallet: Keypair.random(), network: 'testnet' })
 
     const fakeResult: PaymentResult = {
@@ -262,6 +274,7 @@ const SESSION_MANIFEST = signManifest({
 
     console.log('✓ Test 6: pay() regression — works correctly after _resolveManifest refactor')
   } finally {
+    mock.restoreAll()
     await server.close()
   }
 }
